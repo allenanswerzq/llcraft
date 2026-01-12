@@ -141,22 +141,6 @@ pub enum Opcode {
     },
 
     // =========================================================================
-    // SYSCALLS - External tool invocations (legacy, prefer explicit tool ops)
-    // =========================================================================
-
-    /// Invoke a syscall (external tool) - legacy, prefer specific tool opcodes
-    Syscall {
-        /// Syscall name (read_file, grep, exec_code, llm_query, etc.)
-        call: String,
-        /// Arguments to the syscall
-        #[serde(default)]
-        args: serde_json::Value,
-        /// Page to store the result
-        #[serde(default)]
-        store_to: Option<String>,
-    },
-
-    // =========================================================================
     // TOOLS - Explicit external tool operations
     // =========================================================================
 
@@ -293,6 +277,23 @@ pub enum Opcode {
         include_trace: bool,
         /// Page to store the reflection result
         store_to: String,
+    },
+
+    /// JIT code injection - LLM generates new opcodes to insert at runtime
+    /// This enables dynamic program modification based on execution state.
+    /// The generated opcodes are inserted immediately after this instruction.
+    Inject {
+        /// Goal/task for the LLM to generate code for
+        goal: String,
+        /// Context pages to include
+        #[serde(default)]
+        context: Vec<String>,
+        /// Include execution trace in context
+        #[serde(default)]
+        include_trace: bool,
+        /// Include current memory state summary
+        #[serde(default)]
+        include_memory: bool,
     },
 
     /// Summarize one or more pages
@@ -548,8 +549,12 @@ impl Opcode {
     pub fn is_io(&self) -> bool {
         matches!(
             self,
-            Opcode::Syscall { .. }
-                | Opcode::Infer { .. }
+            Opcode::Infer { .. }
+                | Opcode::ReadFile { .. }
+                | Opcode::WriteFile { .. }
+                | Opcode::ListDir { .. }
+                | Opcode::Exec { .. }
+                | Opcode::Grep { .. }
                 | Opcode::Send { .. }
                 | Opcode::Recv { .. }
         )
@@ -596,7 +601,11 @@ impl Opcode {
             Opcode::Store { page_id, .. } => vec![page_id.as_str()],
             Opcode::Alloc { label, .. } => label.as_ref().map(|s| vec![s.as_str()]).unwrap_or_default(),
             Opcode::Copy { dst, .. } => vec![dst.as_str()],
-            Opcode::Syscall { store_to, .. } => store_to.as_ref().map(|s| vec![s.as_str()]).unwrap_or_default(),
+            Opcode::ReadFile { store_to, .. } => vec![store_to.as_str()],
+            Opcode::WriteFile { store_to, .. } => store_to.as_ref().map(|s| vec![s.as_str()]).unwrap_or_default(),
+            Opcode::ListDir { store_to, .. } => vec![store_to.as_str()],
+            Opcode::Exec { store_to, .. } => vec![store_to.as_str()],
+            Opcode::Grep { store_to, .. } => vec![store_to.as_str()],
             Opcode::Infer { store_to, .. } => vec![store_to.as_str()],
             Opcode::Summarize { store_to, .. } => vec![store_to.as_str()],
             Opcode::Merge { store_to, .. } => vec![store_to.as_str()],
@@ -689,10 +698,6 @@ impl Opcode {
         match self {
             Opcode::Label { name } => ("LABEL", format!(":{}", name)),
             Opcode::Log { level, message } => ("LOG", format!("[{:?}] \"{}\"", level, truncate(message, 30))),
-            Opcode::Syscall { call, args, store_to } => {
-                let store = store_to.as_ref().map(|s| format!(" → {}", s)).unwrap_or_default();
-                ("SYSCALL", format!("{}({}){}", call, format_args_brief(args), store))
-            }
             Opcode::Infer { prompt, context, store_to, .. } => {
                 let ctx = if context.is_empty() { String::new() } else { format!(" [{}]", context.join(", ")) };
                 ("INFER", format!("\"{}\"{}  → {}", truncate(prompt, 25), ctx, store_to))
@@ -748,6 +753,31 @@ impl Opcode {
                 let trace = if *include_trace { " +trace" } else { "" };
                 ("REFLECT", format!("\"{}\"{}  → {}", truncate(question, 25), trace, store_to))
             }
+            Opcode::Inject { goal, context, include_trace, include_memory } => {
+                let ctx = if context.is_empty() { String::new() } else { format!(" [{}]", context.join(", ")) };
+                let flags = format!("{}{}",
+                    if *include_trace { " +trace" } else { "" },
+                    if *include_memory { " +mem" } else { "" }
+                );
+                ("INJECT", format!("\"{}\"{}{}  → <dynamic>", truncate(goal, 25), ctx, flags))
+            }
+            // Tool opcodes
+            Opcode::ReadFile { path, store_to } => {
+                ("READ_FILE", format!("\"{}\" → {}", path, store_to))
+            }
+            Opcode::WriteFile { path, store_to, .. } => {
+                let store = store_to.as_ref().map(|s| format!(" → {}", s)).unwrap_or_default();
+                ("WRITE_FILE", format!("\"{}\"{}",  path, store))
+            }
+            Opcode::ListDir { path, store_to } => {
+                ("LIST_DIR", format!("\"{}\" → {}", path, store_to))
+            }
+            Opcode::Exec { command, store_to } => {
+                ("EXEC", format!("\"{}\" → {}", truncate(command, 30), store_to))
+            }
+            Opcode::Grep { pattern, path, store_to } => {
+                ("GREP", format!("\"{}\" in \"{}\" → {}", pattern, path, store_to))
+            }
         }
     }
 }
@@ -797,10 +827,9 @@ mod tests {
 
     #[test]
     fn test_opcode_serialization() {
-        let op = Opcode::Syscall {
-            call: "read_file".to_string(),
-            args: serde_json::json!({"path": "src/main.rs"}),
-            store_to: Some("file_content".to_string()),
+        let op = Opcode::ReadFile {
+            path: "src/main.rs".to_string(),
+            store_to: "file_content".to_string(),
         };
 
         let json = serde_json::to_string_pretty(&op).unwrap();
@@ -816,10 +845,9 @@ mod tests {
             "analyze_file",
             "Analyze File",
             vec![
-                Opcode::Syscall {
-                    call: "read_file".to_string(),
-                    args: serde_json::json!({"path": "target.rs"}),
-                    store_to: Some("content".to_string()),
+                Opcode::ReadFile {
+                    path: "target.rs".to_string(),
+                    store_to: "content".to_string(),
                 },
                 Opcode::Infer {
                     prompt: "Analyze this code for bugs".to_string(),

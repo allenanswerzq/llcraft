@@ -40,7 +40,7 @@ pub struct LlmRequest {
     pub prompt: String,
     /// Context pages to include
     pub context_pages: Vec<String>,
-    /// Where to store the result
+    /// Where to store the result (empty for Inject - code goes into program)
     pub store_to: String,
     /// Current execution state for continuation
     pub execution_state: ExecutionState,
@@ -51,6 +51,8 @@ pub enum LlmRequestType {
     Infer,
     Plan,
     Reflect { include_trace: bool },
+    /// JIT injection - LLM should return opcodes to insert
+    Inject { include_trace: bool, include_memory: bool },
 }
 
 /// Serializable execution state for pause/resume
@@ -344,6 +346,45 @@ impl<S: SyscallHandler> Interpreter<S> {
         Ok(())
     }
 
+    /// Inject opcodes into the program at the current position (JIT)
+    /// The new opcodes are inserted after the current INJECT instruction.
+    /// Returns the number of opcodes injected.
+    pub fn inject_opcodes(&mut self, opcodes: Vec<Opcode>) -> Result<usize> {
+        let count = opcodes.len();
+        if count == 0 {
+            self.pc += 1;
+            return Ok(0);
+        }
+
+        // Insert opcodes after current PC
+        let insert_pos = self.pc + 1;
+
+        // Update any labels that point past the insertion point
+        for (_, label_pc) in self.labels.iter_mut() {
+            if *label_pc >= insert_pos {
+                *label_pc += count;
+            }
+        }
+
+        // Scan new opcodes for any labels and add them
+        for (i, op) in opcodes.iter().enumerate() {
+            if let Opcode::Label { name } = op {
+                self.labels.insert(name.clone(), insert_pos + i);
+            }
+        }
+
+        // Insert the new opcodes
+        self.program.code.splice(insert_pos..insert_pos, opcodes);
+
+        // Record what happened
+        self.record_step("INJECT", &format!("{} opcodes inserted", count), None);
+
+        // Move past the INJECT instruction
+        self.pc += 1;
+
+        Ok(count)
+    }
+
     /// Get current execution state (for serialization)
     pub fn state(&self) -> ExecutionState {
         ExecutionState {
@@ -563,14 +604,47 @@ impl<S: SyscallHandler> Interpreter<S> {
                 Ok(StepResult::Fail(error.clone()))
             }
 
-            // Syscalls
-            Opcode::Syscall { call, args, store_to } => {
-                let result = self.syscall_handler.call(call, args)?;
-                let result_str = format!("{:?}", result);
+            // Tool operations - explicit file/exec tools
+            Opcode::ReadFile { path, store_to } => {
+                let result = self.syscall_handler.call("read_file", &serde_json::json!({"path": path}))?;
+                self.memory.store(store_to, result)?;
+                self.record_step("READ_FILE", path, None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::WriteFile { path, content, store_to } => {
+                let result = self.syscall_handler.call("write_file", &serde_json::json!({
+                    "path": path,
+                    "content": content
+                }))?;
                 if let Some(page_id) = store_to {
                     self.memory.store(page_id, result)?;
                 }
-                self.record_step(&format!("SYSCALL:{}", call), &result_str, None);
+                self.record_step("WRITE_FILE", path, None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::ListDir { path, store_to } => {
+                let result = self.syscall_handler.call("list_dir", &serde_json::json!({"path": path}))?;
+                self.memory.store(store_to, result)?;
+                self.record_step("LIST_DIR", path, None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::Exec { command, store_to } => {
+                let result = self.syscall_handler.call("exec", &serde_json::json!({"command": command}))?;
+                self.memory.store(store_to, result)?;
+                self.record_step("EXEC", command, None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::Grep { pattern, path, store_to } => {
+                let result = self.syscall_handler.call("grep", &serde_json::json!({
+                    "pattern": pattern,
+                    "path": path
+                }))?;
+                self.memory.store(store_to, result)?;
+                self.record_step("GREP", &format!("{} in {}", pattern, path), None);
                 Ok(StepResult::Continue)
             }
 
@@ -604,6 +678,21 @@ impl<S: SyscallHandler> Interpreter<S> {
                     prompt: question.clone(),
                     context_pages: vec![],
                     store_to: store_to.clone(),
+                    execution_state: self.state(),
+                }))
+            }
+
+            // JIT code injection - LLM generates opcodes at runtime
+            Opcode::Inject { goal, context, include_trace, include_memory } => {
+                self.record_step("INJECT", "awaiting LLM to generate opcodes", None);
+                Ok(StepResult::NeedsLlm(LlmRequest {
+                    request_type: LlmRequestType::Inject {
+                        include_trace: *include_trace,
+                        include_memory: *include_memory,
+                    },
+                    prompt: goal.clone(),
+                    context_pages: context.clone(),
+                    store_to: String::new(), // Not used for INJECT
                     execution_state: self.state(),
                 }))
             }
@@ -872,15 +961,14 @@ mod tests {
     }
 
     #[test]
-    fn test_syscall() {
+    fn test_list_dir() {
         let program = Program::new(
-            "test_syscall",
-            "Test Syscall",
+            "test_list_dir",
+            "Test ListDir",
             vec![
-                Opcode::Syscall {
-                    call: "list_dir".to_string(),
-                    args: serde_json::json!({"path": "."}),
-                    store_to: Some("files".to_string()),
+                Opcode::ListDir {
+                    path: ".".to_string(),
+                    store_to: "files".to_string(),
                 },
                 Opcode::Complete {
                     result: serde_json::json!({"files_page": "files"}),

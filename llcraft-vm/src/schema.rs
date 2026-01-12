@@ -170,6 +170,12 @@ impl VmSchema {
                         params: vec!["question: string", "include_trace: bool", "store_to: string"],
                         example: Some(r#"{"op": "REFLECT", "question": "Did the edit succeed? What should I do next?", "include_trace": true, "store_to": "reflection"}"#),
                     },
+                    OpcodeSpec {
+                        name: "INJECT",
+                        description: "JIT code injection - generate new opcodes at runtime based on current state. The generated opcodes are inserted immediately after this instruction and executed. Use for dynamic multi-step tasks where the next steps depend on what was discovered.",
+                        params: vec!["goal: string", "context?: string[]", "include_trace?: bool", "include_memory?: bool"],
+                        example: Some(r#"{"op": "INJECT", "goal": "Based on what we found, generate opcodes to process each file", "context": ["file_list"], "include_trace": true}"#),
+                    },
                 ],
             },
             OpcodeCategory {
