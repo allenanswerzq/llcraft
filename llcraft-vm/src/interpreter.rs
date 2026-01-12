@@ -253,6 +253,8 @@ pub struct Interpreter<S: SyscallHandler> {
     max_steps: usize,
     /// Log callback
     log_callback: Option<Box<dyn Fn(LogLevel, &str) + Send + Sync>>,
+    /// Pending spawned tasks (task_id -> opcode)
+    pending_tasks: HashMap<String, Opcode>,
 }
 
 impl<S: SyscallHandler> Interpreter<S> {
@@ -279,6 +281,7 @@ impl<S: SyscallHandler> Interpreter<S> {
             steps: 0,
             max_steps: MAX_STEPS,
             log_callback: None,
+            pending_tasks: HashMap::new(),
         }
     }
 
@@ -336,6 +339,7 @@ impl<S: SyscallHandler> Interpreter<S> {
             steps: state.steps,
             max_steps: MAX_STEPS,
             log_callback: None,
+            pending_tasks: HashMap::new(),
         }
     }
 
@@ -822,7 +826,86 @@ impl<S: SyscallHandler> Interpreter<S> {
                 Err(error::not_implemented("LOOP"))
             }
 
-            Opcode::Fork { .. } | Opcode::Join { .. } | Opcode::Send { .. } | Opcode::Recv { .. } | Opcode::Wait { .. } => {
+            Opcode::Spawn { task_id, task } => {
+                // Record spawned task for later parallel execution
+                self.pending_tasks.insert(task_id.clone(), (**task).clone());
+                self.record_step("SPAWN", &task_id, None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::Join { task_ids, store_to } => {
+                // Collect results from spawned tasks (or all if empty)
+                let ids: Vec<String> = if task_ids.is_empty() {
+                    self.pending_tasks.keys().cloned().collect()
+                } else {
+                    task_ids.clone()
+                };
+
+                // For now, execute tasks sequentially (async runtime would parallelize)
+                let mut results = serde_json::Map::new();
+                let mut all_success = true;
+
+                for id in &ids {
+                    if let Some(task) = self.pending_tasks.remove(id) {
+                        // Execute the task opcode
+                        if let Err(e) = self.execute_opcode(&task) {
+                            results.insert(id.clone(), serde_json::json!({
+                                "success": false,
+                                "error": e.to_string()
+                            }));
+                            all_success = false;
+                        } else {
+                            // Task completed successfully
+                            results.insert(id.clone(), serde_json::json!({
+                                "success": true,
+                                "completed": true
+                            }));
+                        }
+                    }
+                }
+
+                // Add top-level success indicator
+                results.insert("success".to_string(), serde_json::json!(all_success));
+
+                self.memory.store(store_to, serde_json::Value::Object(results))?;
+                self.record_step("JOIN", &store_to, None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::Parallel { branches, store_to } => {
+                // Execute all branches (sequentially for now, async runtime would parallelize)
+                let mut results = serde_json::Map::new();
+                let mut all_success = true;
+
+                for branch in branches {
+                    let mut branch_ok = true;
+                    for op in &branch.ops {
+                        if let Err(e) = self.execute_opcode(op) {
+                            results.insert(branch.id.clone(), serde_json::json!({
+                                "success": false,
+                                "error": e.to_string()
+                            }));
+                            branch_ok = false;
+                            all_success = false;
+                            break;
+                        }
+                    }
+                    if branch_ok {
+                        results.insert(branch.id.clone(), serde_json::json!({
+                            "success": true
+                        }));
+                    }
+                }
+
+                // Add top-level success indicator
+                results.insert("success".to_string(), serde_json::json!(all_success));
+
+                self.memory.store(store_to, serde_json::Value::Object(results))?;
+                self.record_step("PARALLEL", &store_to, None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::Send { .. } | Opcode::Recv { .. } | Opcode::Wait { .. } => {
                 Err(error::not_implemented("Process operations"))
             }
         }
@@ -1021,5 +1104,122 @@ mod tests {
             }
             _ => panic!("Expected Complete"),
         }
+    }
+
+    #[test]
+    fn test_spawn_join() {
+        // Test SPAWN and JOIN for parallel execution
+        let program = Program::new(
+            "test_spawn_join",
+            "Test Spawn/Join",
+            vec![
+                Opcode::Label { name: "entry".to_string() },
+                // Spawn two LIST_DIR tasks
+                Opcode::Spawn {
+                    task_id: "t1".to_string(),
+                    task: Box::new(Opcode::ListDir {
+                        path: "src".to_string(),
+                        store_to: "src_files".to_string(),
+                    }),
+                },
+                Opcode::Spawn {
+                    task_id: "t2".to_string(),
+                    task: Box::new(Opcode::Store {
+                        page_id: "store_test".to_string(),
+                        data: serde_json::json!({"value": 42}),
+                    }),
+                },
+                // Join and wait for both tasks
+                Opcode::Join {
+                    task_ids: vec!["t1".to_string(), "t2".to_string()],
+                    store_to: "join_results".to_string(),
+                },
+                // Complete with the results
+                Opcode::Complete {
+                    result: serde_json::json!({"done": true}),
+                },
+            ],
+        );
+
+        let mut interp = Interpreter::new(program, DefaultSyscallHandler::default());
+        let result = interp.run().unwrap();
+
+        match result {
+            ExecutionResult::Complete(v) => {
+                assert_eq!(v, serde_json::json!({"done": true}));
+            }
+            _ => panic!("Expected Complete, got {:?}", result),
+        }
+
+        // Verify the spawned tasks executed and stored to pages
+        let src_files = interp.get_page("src_files");
+        assert!(src_files.is_some(), "src_files page should exist");
+        let src_content = src_files.unwrap();
+        assert_eq!(src_content.get("success"), Some(&serde_json::json!(true)));
+
+        let store_test = interp.get_page("store_test");
+        assert!(store_test.is_some(), "store_test page should exist");
+        assert_eq!(store_test.unwrap().get("value"), Some(&serde_json::json!(42)));
+
+        // Join results should have completion status for both tasks
+        let join_results = interp.get_page("join_results");
+        assert!(join_results.is_some(), "join_results page should exist");
+        let join_content = join_results.unwrap();
+        assert!(join_content.get("t1").is_some());
+        assert!(join_content.get("t2").is_some());
+    }
+
+    #[test]
+    fn test_parallel_branches() {
+        // Test PARALLEL with multiple branches
+        let program = Program::new(
+            "test_parallel",
+            "Test Parallel",
+            vec![
+                Opcode::Parallel {
+                    branches: vec![
+                        crate::opcode::ParallelBranch {
+                            id: "b1".to_string(),
+                            ops: vec![
+                                Opcode::Store {
+                                    page_id: "page_a".to_string(),
+                                    data: serde_json::json!({"a": 1}),
+                                },
+                            ],
+                        },
+                        crate::opcode::ParallelBranch {
+                            id: "b2".to_string(),
+                            ops: vec![
+                                Opcode::Store {
+                                    page_id: "page_b".to_string(),
+                                    data: serde_json::json!({"b": 2}),
+                                },
+                            ],
+                        },
+                    ],
+                    store_to: "parallel_results".to_string(),
+                },
+                Opcode::Complete {
+                    result: serde_json::json!({"done": true}),
+                },
+            ],
+        );
+
+        let mut interp = Interpreter::new(program, DefaultSyscallHandler::default());
+        let result = interp.run().unwrap();
+
+        match result {
+            ExecutionResult::Complete(_) => {}
+            _ => panic!("Expected Complete"),
+        }
+
+        // Both branch pages should exist
+        assert!(interp.get_page("page_a").is_some());
+        assert!(interp.get_page("page_b").is_some());
+
+        // Parallel results should have success for both branches
+        let parallel_results = interp.get_page("parallel_results").unwrap();
+        assert_eq!(parallel_results.get("b1").unwrap().get("success"), Some(&serde_json::json!(true)));
+        assert_eq!(parallel_results.get("b2").unwrap().get("success"), Some(&serde_json::json!(true)));
     }
 }

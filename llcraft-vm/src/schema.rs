@@ -358,6 +358,30 @@ impl VmSchema {
                     },
                 ],
             },
+            OpcodeCategory {
+                name: "Parallel Execution",
+                description: "Spawn and join concurrent tasks for parallel operations",
+                opcodes: vec![
+                    OpcodeSpec {
+                        name: "SPAWN",
+                        description: "Spawn a task to run concurrently. The task is queued for later JOIN.",
+                        params: vec!["task_id: string", "task: opcode"],
+                        example: Some(r#"{"op": "SPAWN", "task_id": "read1", "task": {"op": "READ_FILE", "path": "a.txt", "store_to": "a"}}"#),
+                    },
+                    OpcodeSpec {
+                        name: "JOIN",
+                        description: "Wait for spawned tasks to complete. Empty task_ids means wait for all.",
+                        params: vec!["task_ids: string[]", "store_to: string"],
+                        example: Some(r#"{"op": "JOIN", "task_ids": ["read1", "read2"], "store_to": "results"}"#),
+                    },
+                    OpcodeSpec {
+                        name: "PARALLEL",
+                        description: "Execute multiple branches concurrently, each branch is a sequence of ops.",
+                        params: vec!["branches: [{id, ops}]", "store_to: string"],
+                        example: Some(r#"{"op": "PARALLEL", "branches": [{"id": "b1", "ops": [{"op": "READ_FILE", "path": "a.txt", "store_to": "a"}]}, {"id": "b2", "ops": [{"op": "READ_FILE", "path": "b.txt", "store_to": "b"}]}], "store_to": "results"}"#),
+                    },
+                ],
+            },
         ]
     }
 

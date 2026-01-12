@@ -199,23 +199,35 @@ pub enum Opcode {
     },
 
     // =========================================================================
-    // PROCESS MANAGEMENT - Multi-process operations
+    // PARALLEL EXECUTION - Spawn and join concurrent tasks
     // =========================================================================
 
-    /// Fork a new process
-    /// Creates a child process with copied state
-    Fork {
-        /// Program for the child to execute
-        program_id: String,
-        /// Arguments for the child
-        #[serde(default)]
-        args: serde_json::Value,
+    /// Spawn a concurrent task
+    /// The task runs independently and results are collected at JOIN
+    Spawn {
+        /// Unique task identifier
+        task_id: String,
+        /// The opcode to execute (typically a tool op like READ_FILE, EXEC, or INFER)
+        task: Box<Opcode>,
     },
 
-    /// Join a child process (wait for completion)
+    /// Wait for spawned tasks and collect their results
+    /// All specified tasks must complete before continuing
     Join {
-        /// Process ID to wait for
-        pid: String,
+        /// Task IDs to wait for (empty = wait for all pending)
+        #[serde(default)]
+        task_ids: Vec<String>,
+        /// Page to store results as {task_id: result, ...}
+        store_to: String,
+    },
+
+    /// Fork execution into parallel branches (higher-level than Spawn)
+    /// Each branch runs a sequence of opcodes, results collected at implicit join
+    Parallel {
+        /// List of branches, each with an id and opcodes to run
+        branches: Vec<ParallelBranch>,
+        /// Page to store all branch results
+        store_to: String,
     },
 
     /// Send a message to another process
@@ -472,6 +484,15 @@ fn default_one() -> usize {
     1
 }
 
+/// A branch in a PARALLEL operation
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParallelBranch {
+    /// Unique identifier for this branch
+    pub id: String,
+    /// Opcodes to execute in this branch
+    pub ops: Vec<Opcode>,
+}
+
 /// Range specification for partial page operations
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
@@ -723,8 +744,21 @@ impl Opcode {
             Opcode::Summarize { pages, store_to, .. } => ("SUMMARIZE", format!("[{}] → {}", pages.join(", "), store_to)),
             Opcode::Chunk { source, chunk_size, .. } => ("CHUNK", format!("{} / {}", source, chunk_size)),
             Opcode::Merge { pages, store_to, .. } => ("MERGE", format!("[{}] → {}", pages.join(", "), store_to)),
-            Opcode::Fork { program_id, .. } => ("FORK", program_id.clone()),
-            Opcode::Join { pid } => ("JOIN", pid.clone()),
+            Opcode::Spawn { task_id, task } => {
+                let (task_name, _) = task.format_parts();
+                ("SPAWN", format!("{} ← {}", task_id, task_name))
+            }
+            Opcode::Join { task_ids, store_to } => {
+                if task_ids.is_empty() {
+                    ("JOIN", format!("all → {}", store_to))
+                } else {
+                    ("JOIN", format!("[{}] → {}", task_ids.join(", "), store_to))
+                }
+            }
+            Opcode::Parallel { branches, store_to } => {
+                let ids: Vec<_> = branches.iter().map(|b| b.id.as_str()).collect();
+                ("PARALLEL", format!("[{}] → {}", ids.join(", "), store_to))
+            }
             Opcode::Send { pid, .. } => ("SEND", format!("→ {}", pid)),
             Opcode::Recv { store_to, .. } => ("RECV", format!("→ {}", store_to)),
             Opcode::Wait { handle, .. } => ("WAIT", handle.clone()),
