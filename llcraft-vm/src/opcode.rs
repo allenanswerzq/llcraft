@@ -141,11 +141,10 @@ pub enum Opcode {
     },
 
     // =========================================================================
-    // SYSCALLS - External tool invocations
+    // SYSCALLS - External tool invocations (legacy, prefer explicit tool ops)
     // =========================================================================
 
-    /// Invoke a syscall (external tool)
-    /// Controlled access to the outside world
+    /// Invoke a syscall (external tool) - legacy, prefer specific tool opcodes
     Syscall {
         /// Syscall name (read_file, grep, exec_code, llm_query, etc.)
         call: String,
@@ -155,6 +154,55 @@ pub enum Opcode {
         /// Page to store the result
         #[serde(default)]
         store_to: Option<String>,
+    },
+
+    // =========================================================================
+    // TOOLS - Explicit external tool operations
+    // =========================================================================
+
+    /// Read a file's contents
+    ReadFile {
+        /// Path to the file
+        path: String,
+        /// Page to store result {success, content, path}
+        store_to: String,
+    },
+
+    /// Write content to a file
+    WriteFile {
+        /// Path to the file
+        path: String,
+        /// Content to write
+        content: String,
+        /// Page to store result {success, path}
+        #[serde(default)]
+        store_to: Option<String>,
+    },
+
+    /// List files in a directory
+    ListDir {
+        /// Path to directory
+        path: String,
+        /// Page to store result {success, files, path}
+        store_to: String,
+    },
+
+    /// Execute a shell command
+    Exec {
+        /// Shell command to execute
+        command: String,
+        /// Page to store result {success, stdout, stderr, exit_code}
+        store_to: String,
+    },
+
+    /// Search for a pattern in files
+    Grep {
+        /// Pattern to search for
+        pattern: String,
+        /// Path to search in
+        path: String,
+        /// Page to store result {success, matches, count}
+        store_to: String,
     },
 
     /// Wait for an async syscall to complete

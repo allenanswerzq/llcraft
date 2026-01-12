@@ -293,14 +293,38 @@ impl VmSchema {
                 ],
             },
             OpcodeCategory {
-                name: "Syscall",
-                description: "External tool invocations",
+                name: "Tools",
+                description: "External tool operations - file I/O, shell commands, search",
                 opcodes: vec![
                     OpcodeSpec {
-                        name: "SYSCALL",
-                        description: "Invoke external tool (read_file, write_file, grep, exec, etc.)",
-                        params: vec!["call: string", "args?: any", "store_to?: string"],
-                        example: Some(r#"{"op": "SYSCALL", "call": "read_file", "args": {"path": "src/main.rs"}, "store_to": "code"}"#),
+                        name: "READ_FILE",
+                        description: "Read a file's contents",
+                        params: vec!["path: string", "store_to: string"],
+                        example: Some(r#"{"op": "READ_FILE", "path": "src/main.rs", "store_to": "code"}"#),
+                    },
+                    OpcodeSpec {
+                        name: "WRITE_FILE",
+                        description: "Write content to a file",
+                        params: vec!["path: string", "content: string", "store_to?: string"],
+                        example: Some(r#"{"op": "WRITE_FILE", "path": "output.txt", "content": "Hello", "store_to": "result"}"#),
+                    },
+                    OpcodeSpec {
+                        name: "LIST_DIR",
+                        description: "List files in a directory",
+                        params: vec!["path: string", "store_to: string"],
+                        example: Some(r#"{"op": "LIST_DIR", "path": "src", "store_to": "files"}"#),
+                    },
+                    OpcodeSpec {
+                        name: "EXEC",
+                        description: "Execute a shell command",
+                        params: vec!["command: string", "store_to: string"],
+                        example: Some(r#"{"op": "EXEC", "command": "find . -name '*.rs'", "store_to": "result"}"#),
+                    },
+                    OpcodeSpec {
+                        name: "GREP",
+                        description: "Search for a pattern in files",
+                        params: vec!["pattern: string", "path: string", "store_to: string"],
+                        example: Some(r#"{"op": "GREP", "pattern": "fn main", "path": "src/", "store_to": "matches"}"#),
                     },
                 ],
             },
@@ -353,9 +377,9 @@ impl VmSchema {
             },
             Guideline {
                 title: "Tool Usage",
-                content: "Use SYSCALL for external operations. Common calls: read_file, write_file, \
-                         grep, exec, list_dir. Always store results to pages for later use. \
-                         Check results with BRANCH and handle errors gracefully.",
+                content: "Use tool opcodes for external operations: READ_FILE, WRITE_FILE, LIST_DIR, EXEC, GREP. \
+                         Results are stored to pages with {success: bool, ...data}. \
+                         Always check results with BRANCH on 'page.success' and handle errors.",
             },
             Guideline {
                 title: "Program Structure",
