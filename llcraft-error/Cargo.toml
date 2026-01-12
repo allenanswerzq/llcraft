@@ -1,0 +1,12 @@
+[package]
+name = "llcraft-error"
+version = "0.1.0"
+edition = "2021"
+description = "Unified error handling for llcraft - LLM Virtual Machine infrastructure"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+
+[dev-dependencies]
+serde_json = "1.0"
