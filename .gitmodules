@@ -1,0 +1,9 @@
+[submodule "third_party/rlm"]
+	path = third_party/rlm
+	url = https://github.com/alexzhang13/rlm.git
+[submodule "third_party/agentfs"]
+	path = third_party/agentfs
+	url = https://github.com/tursodatabase/agentfs.git
+[submodule "third_party/agent-browser"]
+	path = third_party/agent-browser
+	url = https://github.com/vercel-labs/agent-browser.git
