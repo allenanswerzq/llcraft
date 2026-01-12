@@ -17,8 +17,9 @@ pub mod storage;
 pub mod schema;
 pub mod provider;
 pub mod interpreter;
+pub mod session;
 
-pub use opcode::{Opcode, Program, Range, InferParams, LogLevel, Register};
+pub use opcode::{Opcode, Program, Range, InferParams, LogLevel, Register, ParallelBranch};
 pub use error::{Error, ErrorKind, ErrorStatus, Result};
 pub use stack::Stack;
 pub use memory::{Memory, MemoryPage};
@@ -35,5 +36,10 @@ pub use interpreter::{
     Interpreter, ExecutionResult, ExecutionState,
     LlmRequest, LlmRequestType,
     SyscallHandler, DefaultSyscallHandler,
+};
+pub use session::{
+    Session, SessionManager, SessionStatus, PageIndex, TraceSummary,
+    SessionBackend, FileBackend, MemoryBackend,
+    ProgressEntry, ProgressLog,
 };
 

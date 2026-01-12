@@ -6,11 +6,13 @@
 //! - Handles control flow (labels, jumps, branches)
 //! - Invokes syscalls for external operations
 //! - Calls the LLM for INFER/PLAN/REFLECT operations
+//! - Manages session persistence for context efficiency
 
 use crate::error::{self, Result};
 use crate::memory::Memory;
 use crate::opcode::{Opcode, Program, LogLevel};
 use crate::schema::ExecutionStep;
+use crate::session::{Session, SessionManager, SessionStatus};
 use crate::stack::Stack;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,6 +55,14 @@ pub enum LlmRequestType {
     Reflect { include_trace: bool },
     /// JIT injection - LLM should return opcodes to insert
     Inject { include_trace: bool, include_memory: bool },
+    /// Batched inference - run multiple prompts concurrently
+    InferBatch {
+        prompts: Vec<String>,
+        context: Vec<serde_json::Value>,
+        store_prefix: String,
+        store_combined: Option<String>,
+        params: crate::opcode::InferParams,
+    },
 }
 
 /// Serializable execution state for pause/resume
@@ -255,6 +265,10 @@ pub struct Interpreter<S: SyscallHandler> {
     log_callback: Option<Box<dyn Fn(LogLevel, &str) + Send + Sync>>,
     /// Pending spawned tasks (task_id -> opcode)
     pending_tasks: HashMap<String, Opcode>,
+    /// Current session for persistence
+    session: Option<Session>,
+    /// Session manager for disk operations (None if initialization failed)
+    session_manager: Option<SessionManager>,
 }
 
 impl<S: SyscallHandler> Interpreter<S> {
@@ -282,7 +296,50 @@ impl<S: SyscallHandler> Interpreter<S> {
             max_steps: MAX_STEPS,
             log_callback: None,
             pending_tasks: HashMap::new(),
+            session: None,
+            session_manager: SessionManager::new(".llcraft/sessions").ok(),
         }
+    }
+
+    /// Set a custom session path
+    pub fn with_session_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
+        self.session_manager = SessionManager::new(path).ok();
+        self
+    }
+
+    /// Set session manager directly
+    pub fn with_session_manager(mut self, manager: SessionManager) -> Self {
+        self.session_manager = Some(manager);
+        self
+    }
+
+    /// Resume an existing session by ID
+    pub fn resume_session(&mut self, session_id: &str) -> Result<()> {
+        let manager = self.session_manager.as_ref()
+            .ok_or_else(|| error::not_initialized("Session manager not initialized"))?;
+        let session = manager.load_session(session_id)?;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    /// Start a new session with a task description
+    pub fn start_session(&mut self, task: impl Into<String>) -> Result<String> {
+        let manager = self.session_manager.as_ref()
+            .ok_or_else(|| error::not_initialized("Session manager not initialized"))?;
+        let session = manager.create_session(task)?;
+        let id = session.metadata.id.clone();
+        self.session = Some(session);
+        Ok(id)
+    }
+
+    /// Get the current session (if any)
+    pub fn session(&self) -> Option<&Session> {
+        self.session.as_ref()
+    }
+
+    /// Get mutable reference to current session
+    pub fn session_mut(&mut self) -> Option<&mut Session> {
+        self.session.as_mut()
     }
 
     /// Set a custom log callback
@@ -340,6 +397,8 @@ impl<S: SyscallHandler> Interpreter<S> {
             max_steps: MAX_STEPS,
             log_callback: None,
             pending_tasks: HashMap::new(),
+            session: None,
+            session_manager: SessionManager::new(".llcraft/sessions").ok(),
         }
     }
 
@@ -905,6 +964,320 @@ impl<S: SyscallHandler> Interpreter<S> {
                 Ok(StepResult::Continue)
             }
 
+            // =========================================================================
+            // SESSION OPERATIONS
+            // =========================================================================
+
+            Opcode::LoadSession { session_id, store_to } => {
+                let manager = match &self.session_manager {
+                    Some(m) => m,
+                    None => {
+                        self.memory.store(store_to, serde_json::json!({
+                            "success": false,
+                            "error": "Session manager not available"
+                        }))?;
+                        return Ok(StepResult::Continue);
+                    }
+                };
+
+                match session_id {
+                    Some(id) => {
+                        // Load specific session
+                        match manager.load_session(id) {
+                            Ok(session) => {
+                                let result = serde_json::json!({
+                                    "success": true,
+                                    "session_id": session.metadata.id,
+                                    "task": session.metadata.task,
+                                    "page_index": session.get_index_json(),
+                                    "trace_summary": session.get_trace_summary(),
+                                    "status": format!("{:?}", session.metadata.status),
+                                    "total_steps": session.metadata.total_steps,
+                                    "llm_calls": session.metadata.llm_calls,
+                                });
+                                self.memory.store(store_to, result)?;
+                                self.session = Some(session);
+                                self.record_step("LOAD_SESSION", id, None);
+                            }
+                            Err(e) => {
+                                self.memory.store(store_to, serde_json::json!({
+                                    "success": false,
+                                    "error": e.to_string()
+                                }))?;
+                                self.record_step("LOAD_SESSION", id, Some(e.to_string()));
+                            }
+                        }
+                    }
+                    None => {
+                        // List available sessions (just IDs, metadata needs separate load)
+                        match manager.list_sessions() {
+                            Ok(session_ids) => {
+                                self.memory.store(store_to, serde_json::json!({
+                                    "success": true,
+                                    "sessions": session_ids,
+                                    "count": session_ids.len()
+                                }))?;
+                                self.record_step("LOAD_SESSION", "listed sessions", None);
+                            }
+                            Err(e) => {
+                                self.memory.store(store_to, serde_json::json!({
+                                    "success": false,
+                                    "sessions": [],
+                                    "error": e.to_string()
+                                }))?;
+                            }
+                        }
+                    }
+                }
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::SaveSession { session_id, store_to } => {
+                let result = if let (Some(ref mut session), Some(ref manager)) = (&mut self.session, &self.session_manager) {
+                    if let Some(id) = session_id {
+                        session.metadata.id = id.clone();
+                    }
+
+                    // Update session metrics
+                    session.metadata.total_steps = self.steps;
+                    session.touch();
+
+                    match manager.save_session(session) {
+                        Ok(()) => serde_json::json!({
+                            "success": true,
+                            "session_id": session.metadata.id,
+                        }),
+                        Err(e) => serde_json::json!({
+                            "success": false,
+                            "error": e.to_string()
+                        })
+                    }
+                } else if self.session.is_none() {
+                    serde_json::json!({
+                        "success": false,
+                        "error": "No active session"
+                    })
+                } else {
+                    serde_json::json!({
+                        "success": false,
+                        "error": "Session manager not available"
+                    })
+                };
+
+                if let Some(ref page_id) = store_to {
+                    self.memory.store(page_id, result)?;
+                }
+                self.record_step("SAVE_SESSION", "saved", None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::LoadPage { page_id, store_to } => {
+                let target = store_to.as_deref().unwrap_or(&page_id);
+
+                let load_result = if let (Some(ref mut session), Some(ref manager)) = (&mut self.session, &self.session_manager) {
+                    match manager.load_page(&session.metadata.id, &page_id) {
+                        Ok(page) => {
+                            session.set_page_loaded(&page_id, true);
+                            Ok(page)
+                        }
+                        Err(e) => Err(e)
+                    }
+                } else {
+                    Err(error::not_initialized("No active session or manager"))
+                };
+
+                match load_result {
+                    Ok(page) => {
+                        // Store the page content under the target name
+                        // Add success flag for branching
+                        let mut content = page.content.clone();
+                        if let serde_json::Value::Object(ref mut obj) = content {
+                            obj.insert("success".to_string(), serde_json::Value::Bool(true));
+                        }
+                        self.memory.store(target, content)?;
+                        self.record_step("LOAD_PAGE", &format!("{} -> {}", page_id, target), None);
+                    }
+                    Err(e) => {
+                        // Try loading from current memory as fallback
+                        if let Some(existing_page) = self.memory.get(&page_id) {
+                            let content = existing_page.content.clone();
+                            self.memory.store(target, content)?;
+                            self.record_step("LOAD_PAGE", &format!("{} (from memory)", page_id), None);
+                        } else {
+                            self.memory.store(target, serde_json::json!({
+                                "success": false,
+                                "error": e.to_string()
+                            }))?;
+                            self.record_step("LOAD_PAGE", &page_id, Some(e.to_string()));
+                        }
+                    }
+                }
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::SavePage { page_id, summary, content_type: _ } => {
+                if let (Some(ref mut session), Some(ref manager)) = (&mut self.session, &self.session_manager) {
+                    // Get page from memory
+                    if let Some(page) = self.memory.get(&page_id) {
+                        // Index the page in session
+                        session.index_page(page, summary.clone());
+
+                        // Save page to disk
+                        match manager.save_page(&session.metadata.id, page) {
+                            Ok(()) => {
+                                self.record_step("SAVE_PAGE", &page_id, None);
+                            }
+                            Err(e) => {
+                                self.record_step("SAVE_PAGE", &page_id, Some(e.to_string()));
+                            }
+                        }
+                    } else {
+                        self.record_step("SAVE_PAGE", &page_id, Some("Page not found in memory".to_string()));
+                    }
+                } else {
+                    self.record_step("SAVE_PAGE", &page_id, Some("No active session or manager".to_string()));
+                }
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::EvictPage { page_id } => {
+                // Remove from active memory but keep in session index
+                self.memory.free(&page_id)?;
+
+                if let Some(ref mut session) = self.session {
+                    session.set_page_loaded(&page_id, false);
+                }
+
+                self.record_step("EVICT_PAGE", &page_id, None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::GetPageIndex { store_to } => {
+                let index = if let Some(ref session) = self.session {
+                    serde_json::json!({
+                        "success": true,
+                        "pages": session.get_index_json(),
+                        "loaded": session.loaded_page_ids(),
+                    })
+                } else {
+                    // No session - return current memory pages
+                    let pages: Vec<serde_json::Value> = self.memory.pages_by_lru()
+                        .iter()
+                        .map(|p| serde_json::json!({
+                            "id": p.id,
+                            "tokens": p.content.to_string().len() / 4,
+                            "loaded": true,
+                        }))
+                        .collect();
+                    serde_json::json!({
+                        "success": true,
+                        "pages": pages,
+                        "note": "No active session - showing memory pages"
+                    })
+                };
+                self.memory.store(store_to, index)?;
+                self.record_step("GET_PAGE_INDEX", store_to, None);
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::SetSessionStatus { status, message } => {
+                if let Some(ref mut session) = self.session {
+                    let new_status = match status.to_lowercase().as_str() {
+                        "active" => SessionStatus::Active,
+                        "completed" => SessionStatus::Completed,
+                        "failed" => SessionStatus::Failed,
+                        "abandoned" => SessionStatus::Abandoned,
+                        _ => SessionStatus::Active,
+                    };
+                    session.metadata.status = new_status;
+
+                    // Store message as active memory entry if provided
+                    if let Some(msg) = message {
+                        let page = crate::memory::MemoryPage::new("_status_message", serde_json::json!(msg));
+                        let _ = session.active_memory.store_page(page);
+                    }
+
+                    self.record_step("SET_SESSION_STATUS", &status, None);
+                } else {
+                    self.record_step("SET_SESSION_STATUS", &status, Some("No active session".to_string()));
+                }
+                Ok(StepResult::Continue)
+            }
+
+            Opcode::GetTraceSummary { store_to, max_entries } => {
+                let max = max_entries.unwrap_or(20);
+                let summary = if let Some(ref session) = self.session {
+                    // Get trace and potentially truncate
+                    let trace = session.get_trace_summary();
+                    let lines: Vec<&str> = trace.lines().collect();
+                    let truncated: String = lines.iter()
+                        .rev()
+                        .take(max)
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    serde_json::json!({
+                        "success": true,
+                        "trace": truncated,
+                        "total_steps": session.metadata.total_steps,
+                    })
+                } else {
+                    // No session - use execution trace
+                    let trace_entries: Vec<serde_json::Value> = self.trace.iter()
+                        .rev()
+                        .take(max)
+                        .map(|e| serde_json::json!({
+                            "step": e.step,
+                            "opcode": e.opcode,
+                            "result": e.result,
+                            "error": e.error,
+                        }))
+                        .collect();
+                    serde_json::json!({
+                        "success": true,
+                        "trace": trace_entries,
+                        "total_steps": self.steps,
+                    })
+                };
+                self.memory.store(store_to, summary)?;
+                self.record_step("GET_TRACE_SUMMARY", store_to, None);
+                Ok(StepResult::Continue)
+            }
+
+            // Batched inference - run multiple LLM queries (returns as pending)
+            // The actual execution happens in the agent loop which runs them concurrently
+            Opcode::InferBatch { prompts, context, store_prefix, store_combined, params } => {
+                // Build context from pages
+                let ctx: Vec<serde_json::Value> = context.iter()
+                    .filter_map(|name| self.memory.get(name))
+                    .map(|p| p.content.clone())
+                    .collect();
+
+                // Create a batched request that the agent loop will handle
+                self.record_step(
+                    "INFER_BATCH",
+                    &format!("{} prompts → {}_*", prompts.len(), store_prefix),
+                    None,
+                );
+
+                // Return NeedsLlm with batch info embedded in request_type
+                // The agent loop is responsible for running these concurrently
+                Ok(StepResult::NeedsLlm(LlmRequest {
+                    request_type: LlmRequestType::InferBatch {
+                        prompts: prompts.clone(),
+                        context: ctx,
+                        store_prefix: store_prefix.clone(),
+                        store_combined: store_combined.clone(),
+                        params: params.clone(),
+                    },
+                    prompt: format!("INFER_BATCH: {} prompts", prompts.len()),
+                    context_pages: context.clone(),
+                    store_to: store_prefix.clone(),
+                    execution_state: self.state(),
+                }))
+            }
+
             Opcode::Send { .. } | Opcode::Recv { .. } | Opcode::Wait { .. } => {
                 Err(error::not_implemented("Process operations"))
             }
@@ -976,12 +1349,20 @@ impl<S: SyscallHandler> Interpreter<S> {
     }
 
     fn record_step(&mut self, opcode: &str, result: &str, error: Option<String>) {
+        let step_num = self.trace.len();
+
+        // Record to execution trace
         self.trace.push(ExecutionStep {
-            step: self.trace.len(),
+            step: step_num,
             opcode: opcode.to_string(),
             result: result.to_string(),
-            error,
+            error: error.clone(),
         });
+
+        // Also record to session if active
+        if let Some(ref mut session) = self.session {
+            session.add_trace(step_num, opcode, result, error.is_some());
+        }
     }
 }
 

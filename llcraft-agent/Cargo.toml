@@ -1,0 +1,11 @@
+[package]
+name = "llcraft-agent"
+version = "0.1.0"
+edition = "2021"
+description = "LLcraft Agent - LLM orchestration for the VM"
+
+[dependencies]
+llcraft-vm = { path = "../llcraft-vm" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }

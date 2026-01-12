@@ -320,6 +320,25 @@ pub enum Opcode {
         store_to: String,
     },
 
+    /// Batched inference - run multiple LLM queries concurrently
+    /// Like RLM's llm_query_batched - much faster than sequential INFER calls
+    /// Results are stored in individual pages based on store_prefix + index
+    InferBatch {
+        /// List of prompts to run concurrently
+        prompts: Vec<String>,
+        /// Context pages to include for ALL prompts
+        #[serde(default)]
+        context: Vec<String>,
+        /// Prefix for result pages (e.g., "result" -> result_0, result_1, ...)
+        store_prefix: String,
+        /// Also store combined results as an array in this page
+        #[serde(default)]
+        store_combined: Option<String>,
+        /// Model parameters (applied to all)
+        #[serde(default)]
+        params: InferParams,
+    },
+
     /// Chunk a large page into smaller pages
     /// For processing large contexts incrementally
     Chunk {
@@ -397,6 +416,87 @@ pub enum Opcode {
         reg: Register,
         /// Page to store the value
         store_to: String,
+    },
+
+    // =========================================================================
+    // SESSION OPERATIONS - Persistent state across invocations
+    // =========================================================================
+
+    /// Load an existing session to continue work
+    /// Restores session state, page index, and trace summary
+    LoadSession {
+        /// Session ID to load (if None, lists available sessions)
+        #[serde(default)]
+        session_id: Option<String>,
+        /// Page to store session info {success, session_id, page_index, trace_summary}
+        store_to: String,
+    },
+
+    /// Save current session state
+    /// Persists session metadata and dirty pages to storage
+    SaveSession {
+        /// Optional session ID (uses current if not specified)
+        #[serde(default)]
+        session_id: Option<String>,
+        /// Page to store result {success, session_id, path}
+        #[serde(default)]
+        store_to: Option<String>,
+    },
+
+    /// Load a specific page from session storage
+    /// For on-demand loading of context (keeps LLM prompts small)
+    LoadPage {
+        /// Page ID to load from session
+        page_id: String,
+        /// Target page to store content (defaults to page_id)
+        #[serde(default)]
+        store_to: Option<String>,
+    },
+
+    /// Save a page to session storage
+    /// Page is indexed for later retrieval
+    SavePage {
+        /// Page ID to save
+        page_id: String,
+        /// Optional summary for the page index (auto-generated if not provided)
+        #[serde(default)]
+        summary: Option<String>,
+        /// Content type hint (code, output, analysis, etc.)
+        #[serde(default)]
+        content_type: Option<String>,
+    },
+
+    /// Evict a page from active memory (but keep in storage)
+    /// The page remains in the index for later re-loading
+    EvictPage {
+        /// Page ID to evict
+        page_id: String,
+    },
+
+    /// Get the page index for session context
+    /// Returns lightweight metadata about all indexed pages
+    GetPageIndex {
+        /// Page to store index {pages: [{id, summary, tokens, content_type, ...}]}
+        store_to: String,
+    },
+
+    /// Update session status (Active, Completed, Failed, Abandoned)
+    SetSessionStatus {
+        /// New status
+        status: String,
+        /// Optional final result/error message
+        #[serde(default)]
+        message: Option<String>,
+    },
+
+    /// Get the compressed trace summary
+    /// Useful for LLM to understand what happened so far
+    GetTraceSummary {
+        /// Page to store trace summary
+        store_to: String,
+        /// Max number of entries to include (most recent)
+        #[serde(default)]
+        max_entries: Option<usize>,
     },
 
     // =========================================================================
@@ -811,6 +911,42 @@ impl Opcode {
             }
             Opcode::Grep { pattern, path, store_to } => {
                 ("GREP", format!("\"{}\" in \"{}\" → {}", pattern, path, store_to))
+            }
+            // Session opcodes
+            Opcode::LoadSession { session_id, store_to } => {
+                let id = session_id.as_deref().unwrap_or("(list)");
+                ("LOAD_SESSION", format!("{} → {}", id, store_to))
+            }
+            Opcode::SaveSession { session_id, store_to } => {
+                let id = session_id.as_deref().unwrap_or("(current)");
+                let store = store_to.as_ref().map(|s| format!(" → {}", s)).unwrap_or_default();
+                ("SAVE_SESSION", format!("{}{}", id, store))
+            }
+            Opcode::LoadPage { page_id, store_to } => {
+                let store = store_to.as_ref().map(|s| format!(" → {}", s)).unwrap_or_default();
+                ("LOAD_PAGE", format!("{}{}", page_id, store))
+            }
+            Opcode::SavePage { page_id, summary, .. } => {
+                let sum = summary.as_ref().map(|s| format!(" \"{}\"", truncate(s, 20))).unwrap_or_default();
+                ("SAVE_PAGE", format!("{}{}", page_id, sum))
+            }
+            Opcode::EvictPage { page_id } => {
+                ("EVICT_PAGE", page_id.clone())
+            }
+            Opcode::GetPageIndex { store_to } => {
+                ("GET_PAGE_INDEX", format!("→ {}", store_to))
+            }
+            Opcode::SetSessionStatus { status, message } => {
+                let msg = message.as_ref().map(|m| format!(" \"{}\"", truncate(m, 20))).unwrap_or_default();
+                ("SET_SESSION_STATUS", format!("{}{}", status, msg))
+            }
+            Opcode::GetTraceSummary { store_to, max_entries } => {
+                let max = max_entries.map(|m| format!(" (max {})", m)).unwrap_or_default();
+                ("GET_TRACE_SUMMARY", format!("→ {}{}", store_to, max))
+            }
+            Opcode::InferBatch { prompts, store_prefix, store_combined, .. } => {
+                let combined = store_combined.as_ref().map(|c| format!(", combined → {}", c)).unwrap_or_default();
+                ("INFER_BATCH", format!("{} prompts → {}_0..{}{}", prompts.len(), store_prefix, prompts.len().saturating_sub(1), combined))
             }
         }
     }

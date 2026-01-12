@@ -113,9 +113,15 @@ impl VmSchema {
                 opcodes: vec![
                     OpcodeSpec {
                         name: "LOAD",
-                        description: "Load a page into working memory",
+                        description: "Load a page from working memory (in-memory only)",
                         params: vec!["page_id: string", "range?: {start, end}"],
                         example: Some(r#"{"op": "LOAD", "page_id": "context"}"#),
+                    },
+                    OpcodeSpec {
+                        name: "LOAD_PAGE",
+                        description: "Load a page from session storage (for pages from previous tasks). Use this to fetch pages shown in the session summary.",
+                        params: vec!["page_id: string", "store_to?: string"],
+                        example: Some(r#"{"op": "LOAD_PAGE", "page_id": "cargo_toml"}"#),
                     },
                     OpcodeSpec {
                         name: "STORE",
@@ -175,6 +181,12 @@ impl VmSchema {
                         description: "JIT code injection - generate new opcodes at runtime based on current state. The generated opcodes are inserted immediately after this instruction and executed. Use for dynamic multi-step tasks where the next steps depend on what was discovered.",
                         params: vec!["goal: string", "context?: string[]", "include_trace?: bool", "include_memory?: bool"],
                         example: Some(r#"{"op": "INJECT", "goal": "Based on what we found, generate opcodes to process each file", "context": ["file_list"], "include_trace": true}"#),
+                    },
+                    OpcodeSpec {
+                        name: "INFER_BATCH",
+                        description: "Batched inference - run multiple LLM queries concurrently. Much faster than sequential INFER calls when you have multiple independent queries. Results stored as prefix_0, prefix_1, etc.",
+                        params: vec!["prompts: string[]", "context?: string[]", "store_prefix: string", "store_combined?: string"],
+                        example: Some(r#"{"op": "INFER_BATCH", "prompts": ["Summarize chunk 1", "Summarize chunk 2"], "context": ["chunk_0", "chunk_1"], "store_prefix": "summary", "store_combined": "all_summaries"}"#),
                     },
                 ],
             },

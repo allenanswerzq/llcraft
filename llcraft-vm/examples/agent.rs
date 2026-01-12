@@ -12,8 +12,8 @@
 
 use llcraft_vm::{
     BridgeProvider, ChatMessage, CompletionRequest, DefaultSyscallHandler, ExecutionResult,
-    Interpreter, LlmProvider, LlmRequest, LlmRequestType, Program, VmSchema, TaskRequest,
-    ExecutionStep, Opcode,
+    Interpreter, LlmProvider, LlmRequest, LlmRequestType, MemoryPage, Program, VmSchema, TaskRequest,
+    ExecutionStep, Opcode, SessionManager, PageIndex,
 };
 
 /// Result from agent execution
@@ -32,6 +32,13 @@ struct Agent {
     full_trace: Vec<ExecutionStep>,
     /// Verbose logging
     verbose: bool,
+    /// Session manager for persistence
+    session_manager: Option<SessionManager>,
+    /// Current session ID
+    session_id: Option<String>,
+    /// Page index from session (rich metadata - NOT content)
+    /// LLM sees these summaries and uses LOAD_PAGE to fetch what it needs
+    page_index: std::collections::HashMap<String, PageIndex>,
 }
 
 impl Agent {
@@ -41,18 +48,85 @@ impl Agent {
             schema: VmSchema::new(),
             full_trace: Vec::new(),
             verbose: true,
+            session_manager: None,
+            session_id: None,
+            page_index: std::collections::HashMap::new(),
         }
+    }
+
+    /// Enable session persistence
+    fn with_session(mut self, session_dir: &str, session_id: Option<&str>) -> Result<Self, String> {
+        let manager = SessionManager::new(session_dir).map_err(|e| e.to_string())?;
+
+        // Either resume existing session or create a new one
+        let (sid, new_page_index) = if let Some(id) = session_id {
+            // Resume existing session
+            if manager.session_exists(id) {
+                let session = manager.load_session(id).map_err(|e| e.to_string())?;
+
+                // Only load page INDEX (rich metadata) - NOT the content!
+                // LLM will use LOAD_PAGE opcode to fetch what it needs
+                let mut page_index = std::collections::HashMap::new();
+
+                println!("Resuming session: {}", id);
+                println!("   Previous task: {}", session.metadata.task);
+                println!("   Available pages (use LOAD_PAGE to fetch content):");
+
+                // Calculate total tokens across all pages
+                let total_tokens: usize = session.page_index.values().map(|idx| idx.tokens).sum();
+
+                for (page_id, idx) in &session.page_index {
+                    // Show rich metadata like RLM's QueryMetadata
+                    println!("     - {} (~{} tokens): {}", page_id, idx.tokens, idx.summary);
+                    page_index.insert(page_id.clone(), idx.clone());
+                }
+
+                if !page_index.is_empty() {
+                    println!("   {} pages indexed (~{} total tokens, content NOT loaded)\n",
+                        page_index.len(), total_tokens);
+                }
+
+                (id.to_string(), page_index)
+            } else {
+                // Create new session with this specific ID
+                println!("Creating new session: {}", id);
+                let session = llcraft_vm::Session::new(id, "agent session");
+                manager.save_session(&session).map_err(|e| e.to_string())?;
+                (id.to_string(), std::collections::HashMap::new())
+            }
+        } else {
+            // Create new session with auto-generated ID
+            let session = manager.create_session("agent session").map_err(|e| e.to_string())?;
+            println!("Created new session: {}", session.metadata.id);
+            (session.metadata.id.clone(), std::collections::HashMap::new())
+        };
+
+        self.session_manager = Some(manager);
+        self.session_id = Some(sid);
+        self.page_index = new_page_index;
+
+        Ok(self)
     }
 
     /// Run a task to completion
     async fn run(&mut self, task: &str) -> Result<AgentResult, String> {
-        println!("🎯 Task: {}\n", task);
+        println!("Task: {}\n", task);
+
+        // Show available pages (rich metadata - LLM must LOAD_PAGE to get content)
+        if !self.page_index.is_empty() {
+            let total_tokens: usize = self.page_index.values().map(|idx| idx.tokens).sum();
+            println!("Available pages in session (~{} tokens total, use LOAD_PAGE to fetch):", total_tokens);
+            for (page_id, idx) in &self.page_index {
+                println!("   - {} (~{} tokens): {}", page_id, idx.tokens, idx.summary);
+            }
+            println!();
+        }
 
         // Step 1: Ask LLM to generate a program ONCE
         let program = self.generate_program(task).await?;
 
         if self.verbose {
-            println!("📜 Generated Program:");
+            println!("Generated Program:");
             program.pretty_print();
         }
 
@@ -64,8 +138,28 @@ impl Agent {
 
     /// Generate a program from the LLM based on the task
     async fn generate_program(&mut self, task: &str) -> Result<Program, String> {
-        // Build the request with execution history
-        let request = TaskRequest::new(task)
+        // Build the request with execution history and session context
+        let mut enhanced_task = task.to_string();
+
+        // Show page INDEX with rich metadata (like RLM's QueryMetadata)
+        // LLM must use LOAD_PAGE to get content
+        if !self.page_index.is_empty() {
+            let total_tokens: usize = self.page_index.values().map(|idx| idx.tokens).sum();
+            enhanced_task.push_str(&format!(
+                "\n\nAVAILABLE PAGES FROM PREVIOUS TASKS (~{} tokens total):\n",
+                total_tokens
+            ));
+            for (page_id, idx) in &self.page_index {
+                enhanced_task.push_str(&format!(
+                    "- Page '{}' (~{} tokens): {}\n",
+                    page_id, idx.tokens, idx.summary
+                ));
+            }
+            enhanced_task.push_str("\nIMPORTANT: Page content is NOT loaded. Use LOAD_PAGE opcode to fetch pages you need.\n");
+            enhanced_task.push_str("You can also use INFER_BATCH to process multiple chunks concurrently.\n");
+        }
+
+        let request = TaskRequest::new(&enhanced_task)
             .with_trace(self.full_trace.clone());
 
         // Build messages
@@ -73,9 +167,12 @@ impl Agent {
         let user = request.user_prompt();
 
         if self.verbose {
-            println!("🤖 Asking LLM to generate program...");
+            println!("Asking LLM to generate program...");
             if !self.full_trace.is_empty() {
                 println!("   (with {} previous execution steps as context)", self.full_trace.len());
+            }
+            if !self.page_index.is_empty() {
+                println!("   (with {} page summaries from session)", self.page_index.len());
             }
         }
 
@@ -125,6 +222,19 @@ impl Agent {
     async fn run_program(&mut self, program: Program) -> Result<AgentResult, String> {
         let mut interp = Interpreter::new(program, DefaultSyscallHandler::default());
 
+        // Connect interpreter to session for LOAD_PAGE opcode to work
+        // LLM uses LOAD_PAGE to fetch pages on-demand (lazy loading)
+        if let (Some(ref manager), Some(ref session_id)) = (&self.session_manager, &self.session_id) {
+            // Clone the manager for the interpreter
+            let interp_manager = SessionManager::new(".llcraft_sessions").map_err(|e| e.to_string())?;
+            interp = interp.with_session_manager(interp_manager);
+            interp.resume_session(session_id).map_err(|e| e.to_string())?;
+
+            if self.verbose {
+                println!("   Session connected - LOAD_PAGE enabled for: {}", session_id);
+            }
+        }
+
         // Set up logging
         if self.verbose {
             interp = interp.with_log_callback(|level, msg| {
@@ -136,15 +246,19 @@ impl Agent {
             match interp.run().map_err(|e| e.to_string())? {
                 ExecutionResult::Complete(result) => {
                     self.full_trace.extend(interp.trace().iter().cloned());
-                    println!("\n✅ Task completed!");
+                    println!("\nTask completed!");
 
                     // Collect all pages for the result
                     let pages = self.collect_pages(&interp);
+
+                    // Save pages to session if enabled
+                    self.save_to_session(&pages)?;
+
                     return Ok(AgentResult { result, pages });
                 }
                 ExecutionResult::Failed(error) => {
                     self.full_trace.extend(interp.trace().iter().cloned());
-                    println!("\n❌ Task failed: {}", error);
+                    println!("\nTask failed: {}", error);
                     return Err(error);
                 }
                 ExecutionResult::NeedsLlm(request) => {
@@ -153,7 +267,33 @@ impl Agent {
                         let opcodes = self.handle_inject_request(&request, &interp).await?;
                         let count = interp.inject_opcodes(opcodes).map_err(|e| e.to_string())?;
                         if self.verbose {
-                            println!("   💉 Injected {} opcodes", count);
+                            println!("   Injected {} opcodes", count);
+                        }
+                    } else if let LlmRequestType::InferBatch { prompts, context, store_prefix, store_combined, .. } = &request.request_type {
+                        // Batched inference - run concurrently
+                        let results = self.handle_infer_batch_request(
+                            prompts,
+                            context,
+                            store_prefix,
+                            store_combined,
+                        ).await?;
+
+                        // Store each result in its own page
+                        for (i, result) in results.iter().enumerate() {
+                            let page_id = format!("{}_{}", store_prefix, i);
+                            interp.provide_llm_response(result.clone(), &page_id)
+                                .map_err(|e| e.to_string())?;
+                        }
+
+                        // Optionally store combined results
+                        if let Some(combined_page) = store_combined {
+                            let combined = serde_json::json!({
+                                "results": results,
+                                "count": results.len(),
+                                "success": true
+                            });
+                            interp.provide_llm_response(combined, combined_page)
+                                .map_err(|e| e.to_string())?;
                         }
                     } else {
                         // Regular LLM request - store response in memory
@@ -170,6 +310,46 @@ impl Agent {
         }
     }
 
+    /// Save pages to session
+    fn save_to_session(&mut self, pages: &std::collections::HashMap<String, serde_json::Value>) -> Result<(), String> {
+        if let (Some(manager), Some(session_id)) = (&self.session_manager, &self.session_id) {
+            // Load existing session (it should exist since we create it in with_session)
+            let mut session = manager.load_session(session_id).map_err(|e| e.to_string())?;
+
+            // Save each page
+            for (page_id, content) in pages {
+                let page = MemoryPage::new(page_id, content.clone());
+                let summary = summarize_value(content);
+                session.index_page(&page, Some(summary.clone()));
+                manager.save_page(session_id, &page).map_err(|e| e.to_string())?;
+
+                // Update our local page index with rich metadata
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let idx = PageIndex {
+                    id: page_id.clone(),
+                    summary,
+                    tokens: page.size_tokens,
+                    content_type: None,
+                    created_at: now,
+                    accessed_at: now,
+                    loaded: false,
+                };
+                self.page_index.insert(page_id.clone(), idx);
+            }
+
+            // Save session metadata
+            manager.save_session(&session).map_err(|e| e.to_string())?;
+
+            if self.verbose {
+                println!("   Saved {} pages to session", pages.len());
+            }
+        }
+        Ok(())
+    }
+
     /// Collect all pages from interpreter for final result
     fn collect_pages(&self, interp: &Interpreter<DefaultSyscallHandler>) -> std::collections::HashMap<String, serde_json::Value> {
         interp.all_pages()
@@ -182,7 +362,7 @@ impl Agent {
         interp: &Interpreter<DefaultSyscallHandler>,
     ) -> Result<serde_json::Value, String> {
         if self.verbose {
-            println!("\n   🤖 LLM Request ({:?})", request.request_type);
+            println!("\n   LLM Request ({:?})", request.request_type);
             println!("      Prompt: {}", truncate(&request.prompt, 60));
         }
 
@@ -228,6 +408,10 @@ impl Agent {
                 // Should not reach here - handled by handle_inject_request
                 unreachable!("INJECT should be handled by handle_inject_request");
             }
+            LlmRequestType::InferBatch { .. } => {
+                // Should not reach here - handled by handle_infer_batch_request
+                unreachable!("INFER_BATCH should be handled by handle_infer_batch_request");
+            }
         };
 
         let completion_request = CompletionRequest::new(vec![
@@ -256,7 +440,7 @@ impl Agent {
         interp: &Interpreter<DefaultSyscallHandler>,
     ) -> Result<Vec<Opcode>, String> {
         if self.verbose {
-            println!("\n   💉 INJECT Request");
+            println!("\n   INJECT Request");
             println!("      Goal: {}", truncate(&request.prompt, 60));
         }
 
@@ -375,6 +559,72 @@ Generate the opcodes now:"#,
         serde_json::from_str::<Vec<Opcode>>(json_str)
             .map_err(|e| format!("Failed to parse injected opcodes: {}\n\nContent:\n{}", e, json_str))
     }
+
+    /// Handle an INFER_BATCH request - run multiple LLM queries
+    /// Note: Currently runs sequentially, but could be made truly parallel
+    /// with proper provider architecture (Clone or Arc<Provider>)
+    async fn handle_infer_batch_request(
+        &self,
+        prompts: &[String],
+        context: &[serde_json::Value],
+        store_prefix: &str,
+        _store_combined: &Option<String>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        if self.verbose {
+            println!("\n   INFER_BATCH Request");
+            println!("      Running {} prompts...", prompts.len());
+        }
+
+        // Build context string once (shared by all prompts)
+        let context_text: String = context.iter()
+            .enumerate()
+            .map(|(i, v)| format!("### Context {}\n{}\n", i, serde_json::to_string_pretty(v).unwrap_or_default()))
+            .collect();
+
+        // Run prompts (sequentially for now due to provider ownership)
+        // TODO: Make truly parallel with Arc<Provider> or channels
+        let mut results = Vec::with_capacity(prompts.len());
+
+        for (i, prompt) in prompts.iter().enumerate() {
+            let full_prompt = if context_text.is_empty() {
+                prompt.clone()
+            } else {
+                format!("{}\n\n## Context:\n{}", prompt, context_text)
+            };
+
+            let req = CompletionRequest::new(vec![ChatMessage::user(full_prompt)]);
+            let result = match self.provider.complete(req).await {
+                Ok(resp) => {
+                    let content = resp.content.unwrap_or_default();
+                    serde_json::json!({
+                        "response": content,
+                        "success": true,
+                        "index": i
+                    })
+                }
+                Err(e) => {
+                    serde_json::json!({
+                        "error": format!("{:?}", e),
+                        "success": false,
+                        "index": i
+                    })
+                }
+            };
+            results.push(result);
+
+            if self.verbose {
+                println!("      [{}/{}] {} → {}", i + 1, prompts.len(), store_prefix,
+                    if results.last().map(|r| r["success"].as_bool().unwrap_or(false)).unwrap_or(false) { "ok" } else { "err" });
+            }
+        }
+
+        if self.verbose {
+            let successes = results.iter().filter(|r| r["success"].as_bool().unwrap_or(false)).count();
+            println!("      Completed: {}/{} successful", successes, results.len());
+        }
+
+        Ok(results)
+    }
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
@@ -385,36 +635,90 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+fn summarize_value(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => {
+            if s.len() > 60 {
+                format!("{}...", &s[..60])
+            } else {
+                s.clone()
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            format!("Object with keys: {:?}", obj.keys().collect::<Vec<_>>())
+        }
+        serde_json::Value::Array(arr) => {
+            format!("Array with {} items", arr.len())
+        }
+        _ => format!("{}", content),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <task>", args[0]);
+    // Parse arguments
+    let mut session_id: Option<String> = None;
+    let mut task_parts: Vec<String> = Vec::new();
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--session" || args[i] == "-s" {
+            if i + 1 < args.len() {
+                session_id = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                eprintln!("Error: --session requires a session ID");
+                std::process::exit(1);
+            }
+        } else {
+            task_parts.push(args[i].clone());
+            i += 1;
+        }
+    }
+
+    if task_parts.is_empty() {
+        eprintln!("Usage: {} [--session <id>] <task>", args[0]);
         eprintln!("Example: {} \"Read Cargo.toml and list the dependencies\"", args[0]);
+        eprintln!("Example: {} --session my_session \"Read Cargo.toml\"", args[0]);
+        eprintln!("\nWith --session, context persists between runs:");
+        eprintln!("  1. {} -s demo \"Read Cargo.toml and extract the package name\"", args[0]);
+        eprintln!("  2. {} -s demo \"What is the version of this package?\"", args[0]);
         std::process::exit(1);
     }
 
-    let task = args[1..].join(" ");
+    let task = task_parts.join(" ");
 
     println!("╔═══════════════════════════════════════════════════════════╗");
     println!("║           LLcraft Agent - End-to-End Demo                 ║");
     println!("║  The LLM generates programs, the VM executes them         ║");
     println!("╚═══════════════════════════════════════════════════════════╝\n");
 
-    run_task(&task).await;
+    run_task(&task, session_id.as_deref()).await;
 }
 
-async fn run_task(task: &str) {
+async fn run_task(task: &str, session_id: Option<&str>) {
     println!();
 
     let mut agent = Agent::new();
+
+    // Enable session persistence if requested
+    if let Some(sid) = session_id {
+        match agent.with_session(".llcraft_sessions", Some(sid)) {
+            Ok(a) => agent = a,
+            Err(e) => {
+                eprintln!("Failed to initialize session: {}", e);
+                return;
+            }
+        }
+    }
 
     match agent.run(task).await {
         Ok(agent_result) => {
             // Try to extract the actual answer from result pages
             println!("\n╔═══════════════════════════════════════════════════════════╗");
-            println!("║                      📋 FINAL ANSWER                       ║");
+            println!("║                      FINAL ANSWER                       ║");
             println!("╚═══════════════════════════════════════════════════════════╝\n");
 
             // Look for the main result page and extract readable content
@@ -423,11 +727,11 @@ async fn run_task(task: &str) {
 
             // Show raw result structure if verbose
             if std::env::var("VERBOSE").is_ok() {
-                println!("\n📦 Raw Result:");
+                println!("\nRaw Result:");
                 println!("{}", serde_json::to_string_pretty(&agent_result.result).unwrap_or_default());
 
                 if !agent_result.pages.is_empty() {
-                    println!("\n📄 All Pages:");
+                    println!("\nAll Pages:");
                     for (id, content) in &agent_result.pages {
                         println!("  {}:", id);
                         let content_str = serde_json::to_string_pretty(content).unwrap_or_default();
@@ -442,15 +746,15 @@ async fn run_task(task: &str) {
             }
         }
         Err(e) => {
-            println!("\n💥 Error: {}", e);
+            println!("\nError: {}", e);
         }
     }
 
     println!("\n═══════════════════════════════════════════════════════════");
-    println!("📊 Execution Trace ({} steps):", agent.full_trace.len());
+    println!("Execution Trace ({} steps):", agent.full_trace.len());
     println!("═══════════════════════════════════════════════════════════");
     for step in &agent.full_trace {
-        let err = step.error.as_ref().map(|e| format!(" ⚠️ {}", e)).unwrap_or_default();
+        let err = step.error.as_ref().map(|e| format!(" {}", e)).unwrap_or_default();
         println!("  {:3}. {} → {}{}", step.step, step.opcode, truncate(&step.result, 50), err);
     }
 }

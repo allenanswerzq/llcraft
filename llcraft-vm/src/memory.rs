@@ -162,6 +162,19 @@ impl Memory {
         Ok(())
     }
 
+    /// Store a pre-built page directly (used when loading from session)
+    pub fn store_page(&mut self, page: MemoryPage) -> Result<()> {
+        if !self.pages.contains_key(&page.id) && self.pages.len() >= MAX_PAGES {
+            return Err(error::page_overflow());
+        }
+
+        let old_tokens = self.pages.get(&page.id).map(|p| p.size_tokens).unwrap_or(0);
+        self.total_tokens = self.total_tokens - old_tokens + page.size_tokens;
+        self.pages.insert(page.id.clone(), page);
+
+        Ok(())
+    }
+
     /// Allocate a new empty page
     pub fn alloc(&mut self, label: Option<String>) -> Result<String> {
         if self.pages.len() >= MAX_PAGES {

@@ -168,3 +168,10 @@ pub fn not_implemented(feature: impl Into<String>) -> Error {
     Error::new(ErrorKind::NotImplemented, format!("'{}' not yet implemented", feature))
         .with_context("feature", feature)
 }
+
+/// Create a NotInitialized error (for components that need setup before use)
+pub fn not_initialized(component: impl Into<String>) -> Error {
+    let component = component.into();
+    Error::new(ErrorKind::ConfigInvalid, format!("'{}' not initialized", component))
+        .with_context("component", component)
+}
