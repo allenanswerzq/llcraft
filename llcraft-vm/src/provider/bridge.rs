@@ -87,8 +87,8 @@ impl LlmProvider for BridgeProvider {
     fn models(&self) -> Vec<String> {
         // These are the models typically available through Copilot
         vec![
-            "claude-sonnet-4".into(),
             "claude-opus-4".into(),
+            "claude-sonnet-4".into(),
             "gpt-4o".into(),
             "gpt-4o-mini".into(),
             "o1".into(),
@@ -455,7 +455,7 @@ mod tests {
     fn test_bridge_provider_config() {
         let provider = BridgeProvider::local();
         assert_eq!(provider.name(), "bridge");
-        assert_eq!(provider.default_model(), "claude-sonnet-4");
+        assert_eq!(provider.default_model(), "claude-opus-4");
     }
 
     #[test]

@@ -222,6 +222,31 @@ pub enum Opcode {
         params: InferParams,
     },
 
+    /// Yield control back to the LLM for planning
+    /// The LLM receives execution history and decides the next program segment
+    /// This enables multi-turn agent execution with persistent state
+    Plan {
+        /// What the LLM should plan/decide
+        goal: String,
+        /// Pages containing relevant context for decision
+        #[serde(default)]
+        context: Vec<String>,
+        /// Page to store the generated program segment
+        store_to: String,
+    },
+
+    /// Reflect on execution and decide next steps
+    /// Like PLAN but specifically for analyzing what happened
+    Reflect {
+        /// Question to answer about the execution
+        question: String,
+        /// Include execution trace in context
+        #[serde(default)]
+        include_trace: bool,
+        /// Page to store the reflection result
+        store_to: String,
+    },
+
     /// Summarize one or more pages
     /// Compresses information for context window management
     Summarize {
@@ -667,6 +692,14 @@ impl Opcode {
             Opcode::Loop { var, over, .. } => ("LOOP", format!("{} in {}", var, over)),
             Opcode::Depth { store_to } => ("DEPTH", format!("→ {}", store_to)),
             Opcode::Clear => ("CLEAR", String::new()),
+            Opcode::Plan { goal, context, store_to } => {
+                let ctx = if context.is_empty() { String::new() } else { format!(" [{}]", context.join(", ")) };
+                ("PLAN", format!("\"{}\"{}  → {}", truncate(goal, 25), ctx, store_to))
+            }
+            Opcode::Reflect { question, include_trace, store_to } => {
+                let trace = if *include_trace { " +trace" } else { "" };
+                ("REFLECT", format!("\"{}\"{}  → {}", truncate(question, 25), trace, store_to))
+            }
         }
     }
 }

@@ -149,3 +149,22 @@ pub fn storage_not_found(key: impl Into<String>) -> Error {
 pub fn storage_failed(reason: impl Into<String>) -> Error {
     Error::new(ErrorKind::StorageFailed, reason)
 }
+
+/// Create an InvalidArgument error
+pub fn invalid_argument(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidArgument, message)
+}
+
+/// Create a LabelNotFound error
+pub fn label_not_found(label: impl Into<String>) -> Error {
+    let label = label.into();
+    Error::new(ErrorKind::InvalidLabel, format!("label '{}' not found", label))
+        .with_context("label", label)
+}
+
+/// Create a NotImplemented error
+pub fn not_implemented(feature: impl Into<String>) -> Error {
+    let feature = feature.into();
+    Error::new(ErrorKind::NotImplemented, format!("'{}' not yet implemented", feature))
+        .with_context("feature", feature)
+}

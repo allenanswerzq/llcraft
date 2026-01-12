@@ -134,6 +134,12 @@ pub enum ErrorKind {
 
     /// Assertion failed
     AssertionFailed,
+
+    /// Invalid argument passed to function
+    InvalidArgument,
+
+    /// Feature or operation not yet implemented
+    NotImplemented,
 }
 
 impl ErrorKind {
@@ -191,6 +197,8 @@ impl ErrorKind {
             // Parse
             ErrorKind::ParseFailed => "ParseFailed",
             ErrorKind::AssertionFailed => "AssertionFailed",
+            ErrorKind::InvalidArgument => "InvalidArgument",
+            ErrorKind::NotImplemented => "NotImplemented",
         }
     }
 

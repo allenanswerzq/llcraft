@@ -1,9 +1,19 @@
-//! # VM Schema for LLM Code Generation
+//! # VM Schema for LLM Agent Execution
 //!
-//! This module provides a structured description of the VM's capabilities
-//! that can be serialized and given to an LLM as context. The model uses
-//! this schema to generate valid programs that efficiently utilize the
-//! context window to solve user tasks.
+//! This module provides a structured description of the LLcraft VM.
+//! The VM enables LLMs to act as intelligent agents by providing:
+//! - Efficient context window management through page-based memory
+//! - Tool integration via syscalls
+//! - Multi-step execution with state persistence
+//! - Self-reflection and planning capabilities
+//!
+//! ## Philosophy
+//! The LLM is the CPU - it thinks, reasons, and decides.
+//! The VM is the instruction set - it executes actions efficiently.
+//! Programs are plans - sequences of operations to accomplish goals.
+//!
+//! Since each LLM invocation is stateless, the VM maintains state between
+//! calls and provides execution history for continuity.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,9 +44,11 @@ impl VmSchema {
     pub fn new() -> Self {
         Self {
             version: "0.1.0",
-            description: "LLcraft VM - A virtual machine where LLMs are the compute unit. \
-                         Programs orchestrate LLM inference, memory management, and tool use \
-                         to solve complex tasks within context window constraints.",
+            description: "LLcraft VM - You are the CPU, the VM is your instruction set.\n\n\
+                         You solve tasks by generating programs that the interpreter executes.\n\
+                         The VM handles context window management, tool execution, and state persistence.\n\
+                         Since each of your invocations is stateless, the VM tracks execution history\n\
+                         and provides it to you for continuity across steps.",
             opcodes: Self::define_opcodes(),
             state: VmStateSchema::default(),
             execution: ExecutionModel::default(),
@@ -132,20 +144,38 @@ impl VmSchema {
                 ],
             },
             OpcodeCategory {
-                name: "Inference",
-                description: "LLM compute operations - the core of the VM",
+                name: "Thinking",
+                description: "LLM reasoning operations - use these when you need to think, analyze, or decide",
                 opcodes: vec![
                     OpcodeSpec {
                         name: "INFER",
-                        description: "Invoke LLM inference with prompt and context pages",
+                        description: "General LLM inference - think about a prompt with context",
                         params: vec![
                             "prompt: string",
                             "context: string[]",
                             "store_to: string",
                             "params?: {temperature, max_tokens, model}",
                         ],
-                        example: Some(r#"{"op": "INFER", "prompt": "Analyze this code", "context": ["code"], "store_to": "analysis"}"#),
+                        example: Some(r#"{"op": "INFER", "prompt": "Analyze this code for bugs", "context": ["code"], "store_to": "analysis"}"#),
                     },
+                    OpcodeSpec {
+                        name: "PLAN",
+                        description: "Generate a plan or next steps based on current state",
+                        params: vec!["goal: string", "context: string[]", "store_to: string"],
+                        example: Some(r#"{"op": "PLAN", "goal": "How should I refactor this function?", "context": ["code", "requirements"], "store_to": "plan"}"#),
+                    },
+                    OpcodeSpec {
+                        name: "REFLECT",
+                        description: "Analyze what happened and decide what to do next (receives execution trace)",
+                        params: vec!["question: string", "include_trace: bool", "store_to: string"],
+                        example: Some(r#"{"op": "REFLECT", "question": "Did the edit succeed? What should I do next?", "include_trace": true, "store_to": "reflection"}"#),
+                    },
+                ],
+            },
+            OpcodeCategory {
+                name: "Context Management",
+                description: "Manage context window efficiently - compress, chunk, merge data",
+                opcodes: vec![
                     OpcodeSpec {
                         name: "SUMMARIZE",
                         description: "Compress pages to fit context window",
@@ -304,32 +334,34 @@ impl VmSchema {
     fn define_guidelines() -> Vec<Guideline> {
         vec![
             Guideline {
+                title: "You Are the Brain",
+                content: "You are the CPU of this system. The VM executes your programs, \
+                         but you make all the decisions. Use INFER/PLAN/REFLECT when you need to think. \
+                         Use SYSCALL when you need to act. Use BRANCH to handle different outcomes.",
+            },
+            Guideline {
+                title: "Stateless But Continuous",
+                content: "Each of your invocations is stateless - you won't remember previous calls. \
+                         The VM maintains state for you in memory pages. Use REFLECT with include_trace=true \
+                         to see what happened before. Store important context in pages for future steps.",
+            },
+            Guideline {
                 title: "Context Window Management",
-                content: "The context window is your primary constraint. Use SUMMARIZE to compress \
-                         information, CHUNK to split large inputs, and FREE to release unused pages. \
+                content: "Your context window is limited. Use SUMMARIZE to compress information, \
+                         CHUNK to split large inputs, and FREE to release unused pages. \
                          Always estimate token usage before loading large data.",
             },
             Guideline {
-                title: "Iterative Refinement",
-                content: "Use INFER in loops with accumulating context. Store intermediate results \
-                         in pages, summarize when they grow too large. Branch based on inference \
-                         quality to retry or adjust prompts.",
-            },
-            Guideline {
-                title: "Tool Integration",
+                title: "Tool Usage",
                 content: "Use SYSCALL for external operations. Common calls: read_file, write_file, \
-                         grep, exec. Always store results to pages for later use in INFER context.",
-            },
-            Guideline {
-                title: "Error Handling",
-                content: "Use BRANCH to check results and handle errors gracefully. Use CHECKPOINT \
-                         before risky operations. FAIL with clear error messages when recovery \
-                         is impossible.",
+                         grep, exec, list_dir. Always store results to pages for later use. \
+                         Check results with BRANCH and handle errors gracefully.",
             },
             Guideline {
                 title: "Program Structure",
-                content: "Start with LABEL 'entry'. Load required context first. Use meaningful \
-                         page names. End with COMPLETE containing the final result.",
+                content: "Start with LABEL 'entry'. End with COMPLETE containing the final result \
+                         or FAIL with a clear error. Use meaningful page names like 'file_content', \
+                         'analysis', 'plan'. Log important steps for debugging.",
             },
         ]
     }
@@ -409,15 +441,16 @@ pub struct ExecutionModel {
 impl Default for ExecutionModel {
     fn default() -> Self {
         Self {
-            description: "Programs execute sequentially with control flow via JUMP/BRANCH/CALL. \
-                         INFER operations invoke the LLM with specified context pages.",
+            description: "The interpreter runs your program. When it needs your input (INFER/PLAN/REFLECT), \
+                         it calls you with the relevant context. Your response is stored and execution continues.",
             flow: vec![
-                "1. Load program and resolve labels",
-                "2. Execute opcodes in sequence",
-                "3. INFER sends prompt + context to LLM, stores response",
-                "4. BRANCH/JUMP modify program counter",
-                "5. CALL pushes frame, RETURN pops frame",
-                "6. COMPLETE/FAIL terminate execution",
+                "1. You receive a task and generate a program",
+                "2. The interpreter executes your program step by step",
+                "3. SYSCALL operations interact with external tools",
+                "4. INFER/PLAN/REFLECT pause execution and call you with context",
+                "5. Your response is stored in the specified page",
+                "6. COMPLETE returns the final result, FAIL reports an error",
+                "7. If the program needs continuation, REFLECT with execution trace helps you decide next steps",
             ],
         }
     }
@@ -445,6 +478,22 @@ pub struct TaskRequest {
     pub constraints: TaskConstraints,
     /// Expected output format
     pub output_format: OutputFormat,
+    /// Execution history from previous steps (for continuation)
+    #[serde(default)]
+    pub execution_trace: Vec<ExecutionStep>,
+}
+
+/// A record of what happened in a previous execution step
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionStep {
+    /// Step number
+    pub step: usize,
+    /// Opcode that was executed
+    pub opcode: String,
+    /// Result or outcome
+    pub result: String,
+    /// Any error that occurred
+    pub error: Option<String>,
 }
 
 impl TaskRequest {
@@ -454,6 +503,7 @@ impl TaskRequest {
             context: vec![],
             constraints: TaskConstraints::default(),
             output_format: OutputFormat::default(),
+            execution_trace: vec![],
         }
     }
 
@@ -471,7 +521,68 @@ impl TaskRequest {
         self
     }
 
-    /// Render as prompt for program generation
+    pub fn with_trace(mut self, trace: Vec<ExecutionStep>) -> Self {
+        self.execution_trace = trace;
+        self
+    }
+
+    /// Generate the system prompt (VM specification)
+    /// This should be used as the system message
+    pub fn system_prompt(schema: &VmSchema) -> String {
+        let mut out = String::new();
+
+        out.push_str("# LLcraft VM Agent\n\n");
+        out.push_str("You are an intelligent agent that solves tasks by generating VM programs.\n");
+        out.push_str("The interpreter will execute your program and call you when it needs your input.\n\n");
+        out.push_str(&schema.to_prompt());
+        out.push_str("\n## Output Format\n");
+        out.push_str("Output a JSON program with fields: id, name, description, code (array of opcodes).\n");
+        out.push_str("Output ONLY valid JSON, no markdown fences or explanation.\n");
+
+        out
+    }
+
+    /// Generate the user prompt (just the task)
+    /// This should be used as the user message
+    pub fn user_prompt(&self) -> String {
+        let mut out = String::new();
+
+        out.push_str("# Task\n\n");
+        out.push_str(&self.task);
+        out.push_str("\n");
+
+        if !self.context.is_empty() {
+            out.push_str("\n## Available Pages\n");
+            for ctx in &self.context {
+                out.push_str(&format!("- `{}`: {} chars", ctx.name, ctx.content.len()));
+                if let Some(tokens) = ctx.tokens {
+                    out.push_str(&format!(" (~{} tokens)", tokens));
+                }
+                out.push('\n');
+            }
+        }
+
+        if !self.execution_trace.is_empty() {
+            out.push_str("\n## Execution History\n");
+            out.push_str("These steps have already been executed:\n\n");
+            for step in &self.execution_trace {
+                if let Some(err) = &step.error {
+                    out.push_str(&format!("{}. {} → ERROR: {}\n", step.step, step.opcode, err));
+                } else {
+                    out.push_str(&format!("{}. {} → {}\n", step.step, step.opcode, step.result));
+                }
+            }
+            out.push_str("\nContinue from where execution left off.\n");
+        }
+
+        if let Some(max) = self.constraints.max_context_tokens {
+            out.push_str(&format!("\n**Constraint**: Max context tokens: {}\n", max));
+        }
+
+        out
+    }
+
+    /// Render as combined prompt (legacy, for backwards compatibility)
     pub fn to_prompt(&self, schema: &VmSchema) -> String {
         let mut out = String::new();
 
@@ -492,6 +603,18 @@ impl TaskRequest {
             out.push('\n');
         }
 
+        if !self.execution_trace.is_empty() {
+            out.push_str("## Execution History\n");
+            for step in &self.execution_trace {
+                if let Some(err) = &step.error {
+                    out.push_str(&format!("{}. {} → ERROR: {}\n", step.step, step.opcode, err));
+                } else {
+                    out.push_str(&format!("{}. {} → {}\n", step.step, step.opcode, step.result));
+                }
+            }
+            out.push('\n');
+        }
+
         out.push_str("## Constraints\n");
         if let Some(max) = self.constraints.max_context_tokens {
             out.push_str(&format!("- Max context tokens: {}\n", max));
@@ -503,8 +626,6 @@ impl TaskRequest {
 
         out.push_str("## VM Specification\n\n");
         out.push_str(&schema.to_prompt());
-
-        out.push_str("\n## Your Task\n");
         out.push_str("Generate a valid LLcraft VM program (JSON) that solves the user's request. ");
         out.push_str("The program should efficiently manage the context window and produce the expected output.\n\n");
         out.push_str("Output the program as a JSON object with fields: id, name, description, code (array of opcodes).\n");

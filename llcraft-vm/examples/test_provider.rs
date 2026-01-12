@@ -42,27 +42,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          If the file doesn't exist, report an error."
     );
 
-    // Generate the prompt
-    let prompt = task.to_prompt(&schema);
+    // Generate prompts using the new separated format
+    let system_prompt = TaskRequest::system_prompt(&schema);
+    let user_prompt = task.user_prompt();
 
     if prompt_only {
-        println!("{}", prompt);
-        println!("\n---\nCopy the above prompt and paste it into ChatGPT/Claude.");
+        println!("=== SYSTEM PROMPT ===\n{}\n", system_prompt);
+        println!("=== USER PROMPT ===\n{}\n", user_prompt);
+        println!("---\nCopy the above prompts and paste them into ChatGPT/Claude.");
         return Ok(());
     }
 
-    // Create messages
-    let system_msg = "You are an expert at generating LLcraft VM programs. Output valid JSON only.";
+    // Create messages with separated system/user prompts
     let messages = vec![
-        ChatMessage::system(system_msg),
-        ChatMessage::user(&prompt),
+        ChatMessage::system(&system_prompt),
+        ChatMessage::user(&user_prompt),
     ];
 
     if verbose {
         println!("=== SYSTEM ===");
-        println!("{}", system_msg);
+        println!("{}", system_prompt);
         println!("\n=== USER PROMPT ===");
-        println!("{}", prompt);
+        println!("{}", user_prompt);
         println!("\n=== END PROMPT ===\n");
     }
 

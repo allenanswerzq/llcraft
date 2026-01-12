@@ -16,18 +16,24 @@ pub mod memory;
 pub mod storage;
 pub mod schema;
 pub mod provider;
+pub mod interpreter;
 
 pub use opcode::{Opcode, Program, Range, InferParams, LogLevel, Register};
 pub use error::{Error, ErrorKind, ErrorStatus, Result};
 pub use stack::Stack;
 pub use memory::{Memory, MemoryPage};
 pub use storage::{Storage, StorageBackend, MemoryStorage, FileStorage};
-pub use schema::{VmSchema, TaskRequest};
+pub use schema::{VmSchema, TaskRequest, ExecutionStep};
 pub use provider::{
     LlmProvider, ProviderConfig, ProviderType, ProviderError,
     ChatMessage, Role, CompletionRequest, CompletionResponse,
     ToolDefinition, ToolCall, ToolChoice,
     StreamChunk, StreamReceiver, FinishReason, Usage, UsageTracker,
     OpenAIProvider, AnthropicProvider, BridgeProvider,
+};
+pub use interpreter::{
+    Interpreter, ExecutionResult, ExecutionState,
+    LlmRequest, LlmRequestType,
+    SyscallHandler, DefaultSyscallHandler,
 };
 
