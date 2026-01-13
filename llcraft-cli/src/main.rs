@@ -554,7 +554,7 @@ fn parse_opcodes(value: &serde_json::Value) -> Vec<llcraft_vm::Opcode> {
             eprintln!("Warning: Failed to parse opcodes as array: {}", e);
         }
     }
-    
+
     // Fall back: try to parse each object individually
     if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) {
         let mut opcodes = Vec::new();
@@ -571,7 +571,7 @@ fn parse_opcodes(value: &serde_json::Value) -> Vec<llcraft_vm::Opcode> {
             return opcodes;
         }
     }
-    
+
     eprintln!("Content: {}", truncate(json_str, 200));
     vec![]
 }
