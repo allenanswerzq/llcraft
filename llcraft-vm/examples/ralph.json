@@ -1,0 +1,115 @@
+{
+  "id": "ralph-agent",
+  "name": "Ralph Agent Loop",
+  "description": "Autonomous agent that works through a PRD until all stories pass. LLcraft equivalent of the Ralph pattern.",
+  "code": [
+    {"op": "LABEL", "name": "entry"},
+    {"op": "LOG", "level": "info", "message": "Starting Ralph agent loop"},
+
+    {"op": "LABEL", "name": "iteration_start"},
+
+    {"op": "READ_FILE", "path": "prd.json", "store_to": "prd"},
+    {"op": "BRANCH", "condition": "prd.success", "if_true": "parse_prd", "if_false": "no_prd"},
+
+    {"op": "LABEL", "name": "no_prd"},
+    {"op": "FAIL", "error": "No prd.json found. Create one first."},
+
+    {"op": "LABEL", "name": "parse_prd"},
+    {"op": "INFER",
+      "prompt": "Parse this PRD and return JSON with: {next_story: {id, title, description, acceptanceCriteria} | null, all_complete: boolean, total: number, completed: number}. Pick the highest priority story where passes is false.",
+      "context": ["prd"],
+      "store_to": "analysis"
+    },
+
+    {"op": "BRANCH", "condition": "analysis.response.all_complete", "if_true": "all_done", "if_false": "work_on_story"},
+
+    {"op": "LABEL", "name": "all_done"},
+    {"op": "LOG", "level": "info", "message": "All stories complete!"},
+    {"op": "COMPLETE", "result": {"status": "success", "message": "All PRD stories implemented"}},
+
+    {"op": "LABEL", "name": "work_on_story"},
+    {"op": "LOG", "level": "info", "message": "Working on next story..."},
+
+    {"op": "READ_FILE", "path": "progress.txt", "store_to": "progress"},
+
+    {"op": "INJECT",
+      "goal": "Implement the user story. Generate opcodes to: 1) Read relevant files, 2) Make necessary changes using WRITE_FILE, 3) Store implementation summary in 'implementation' page. Use the progress.txt learnings to avoid past mistakes.",
+      "context": ["analysis", "progress"],
+      "include_trace": true,
+      "include_memory": true
+    },
+
+    {"op": "LABEL", "name": "run_checks"},
+    {"op": "LOG", "level": "info", "message": "Running quality checks..."},
+    {"op": "EXEC", "command": "npm run typecheck 2>&1 || cargo check 2>&1 || echo 'No typecheck configured'", "store_to": "typecheck"},
+    {"op": "EXEC", "command": "npm test 2>&1 || cargo test 2>&1 || echo 'No tests configured'", "store_to": "tests"},
+
+    {"op": "INFER",
+      "prompt": "Did the quality checks pass? Return {passed: boolean, issues: string[]}",
+      "context": ["typecheck", "tests"],
+      "store_to": "check_result"
+    },
+
+    {"op": "BRANCH", "condition": "check_result.response.passed", "if_true": "commit_changes", "if_false": "fix_issues"},
+
+    {"op": "LABEL", "name": "fix_issues"},
+    {"op": "LOG", "level": "warn", "message": "Checks failed, attempting fix..."},
+    {"op": "INJECT",
+      "goal": "Fix the issues found in quality checks. Generate opcodes to read the problematic files, fix them, and store result in 'fix_result' page.",
+      "context": ["check_result", "typecheck", "tests", "implementation"],
+      "include_trace": true
+    },
+    {"op": "JUMP", "target": "run_checks"},
+
+    {"op": "LABEL", "name": "commit_changes"},
+    {"op": "LOG", "level": "info", "message": "Checks passed, committing..."},
+
+    {"op": "INFER",
+      "prompt": "Generate a git commit message for this story. Return just the message string, no JSON.",
+      "context": ["analysis", "implementation"],
+      "store_to": "commit_msg"
+    },
+
+    {"op": "EXEC", "command": "git add -A", "store_to": "git_add"},
+    {"op": "EXEC", "command": "git commit -m \"$COMMIT_MSG\"", "store_to": "git_commit"},
+
+    {"op": "LABEL", "name": "update_prd"},
+    {"op": "LOG", "level": "info", "message": "Updating PRD status..."},
+
+    {"op": "INFER",
+      "prompt": "Update the PRD JSON to set passes: true for the completed story. Return the complete updated JSON.",
+      "context": ["prd", "analysis"],
+      "store_to": "updated_prd"
+    },
+
+    {"op": "WRITE_FILE",
+      "path": "prd.json",
+      "content": "{{updated_prd.response}}",
+      "store_to": "prd_write"
+    },
+
+    {"op": "LABEL", "name": "update_progress"},
+    {"op": "LOG", "level": "info", "message": "Appending to progress log..."},
+
+    {"op": "INFER",
+      "prompt": "Generate a progress entry with: story ID, what was implemented, files changed, and learnings for future iterations. Format as markdown.",
+      "context": ["analysis", "implementation", "progress"],
+      "store_to": "progress_entry"
+    },
+
+    {"op": "READ_FILE", "path": "progress.txt", "store_to": "current_progress"},
+    {"op": "INFER",
+      "prompt": "Append the new progress entry to the existing progress file. Return the complete updated content.",
+      "context": ["current_progress", "progress_entry"],
+      "store_to": "full_progress"
+    },
+    {"op": "WRITE_FILE",
+      "path": "progress.txt",
+      "content": "{{full_progress.response}}",
+      "store_to": "progress_write"
+    },
+
+    {"op": "LOG", "level": "info", "message": "Story complete, starting next iteration..."},
+    {"op": "JUMP", "target": "iteration_start"}
+  ]
+}

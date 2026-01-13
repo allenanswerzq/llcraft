@@ -12,4 +12,9 @@
 
 mod agent;
 
-pub use agent::{Agent, AgentResult, AgentConfig};
+pub use agent::{Agent, AgentConfig, AgentResult};
+
+/// Get a human-readable summary of the VM schema (available opcodes)
+pub fn schema_summary() -> &'static str {
+    llcraft_vm::SYSTEM_PROMPT
+}

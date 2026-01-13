@@ -1,13 +1,7 @@
-[workspace]
-resolver = "2"
-members = [
-    "llcraft-error",
-    "llcraft-vm",
-    "llcraft-agent",
-    "llcraft-cli",
-]
-
-[workspace.package]
+[package]
+name = "llcraft-demo"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }

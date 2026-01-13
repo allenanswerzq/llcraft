@@ -1,0 +1,6 @@
+progress:
+- previously missing progress.txt; created to record learnings
+- added src/log.rs defining LogLevel enum with Debug, Clone, Copy, Serialize, Deserialize
+- added src/lib.rs re-exporting LogLevel
+- appended serde dependency to Cargo.toml to enable derive macros
+notes: avoid overwriting full Cargo.toml in future; prefer targeted edits to [dependencies] section.

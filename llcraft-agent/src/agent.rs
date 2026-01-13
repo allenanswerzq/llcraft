@@ -3,7 +3,7 @@
 use llcraft_vm::{
     BridgeProvider, ChatMessage, CompletionRequest, DefaultSyscallHandler, ExecutionResult,
     Interpreter, LlmProvider, LlmRequest, LlmRequestType, MemoryPage, Opcode, PageIndex,
-    Program, Session, SessionManager, TaskRequest, VmSchema,
+    Program, Session, SessionManager, VmSchema,
 };
 use std::collections::HashMap;
 
@@ -166,29 +166,8 @@ impl Agent {
 
     /// Generate a program from the LLM based on the task
     async fn generate_program(&mut self, task: &str) -> Result<Program, String> {
-        let mut enhanced_task = task.to_string();
-
-        if !self.page_index.is_empty() {
-            let total_tokens: usize = self.page_index.values().map(|idx| idx.tokens).sum();
-            enhanced_task.push_str(&format!(
-                "\n\nAVAILABLE PAGES FROM PREVIOUS TASKS (~{} tokens total):\n",
-                total_tokens
-            ));
-            for (page_id, idx) in &self.page_index {
-                enhanced_task.push_str(&format!(
-                    "- Page '{}' (~{} tokens): {}\n",
-                    page_id, idx.tokens, idx.summary
-                ));
-            }
-            enhanced_task.push_str(
-                "\nIMPORTANT: Page content is NOT loaded. Use LOAD_PAGE opcode to fetch pages you need.\n",
-            );
-        }
-
-        let request = TaskRequest::new(&enhanced_task).with_trace(self.full_trace.clone());
-
-        let system = TaskRequest::system_prompt(&self.schema);
-        let user = request.user_prompt();
+        let system = self.schema.system_prompt().to_string();
+        let user = self.schema.user_prompt(task, self.page_index.iter(), &self.full_trace);
 
         if self.config.verbose {
             println!("Asking LLM to generate program...");
@@ -207,8 +186,8 @@ impl Agent {
         }
 
         let completion_request = CompletionRequest::new(vec![
-            ChatMessage::system(system),
-            ChatMessage::user(user),
+            ChatMessage::system(&system),
+            ChatMessage::user(&user),
         ]);
 
         let response = self

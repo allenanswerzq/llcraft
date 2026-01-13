@@ -1,0 +1,10 @@
+# Ralph Progress Log
+
+Started: 2026-01-12
+
+## Codebase Patterns
+- Use `serde::{Serialize, Deserialize}` for all types that need JSON conversion
+- Opcodes are defined in `opcode.rs`, interpreter logic in `interpreter.rs`
+- Always re-export new types from `lib.rs`
+
+---

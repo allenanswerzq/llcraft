@@ -1,0 +1,33 @@
+{
+  "project": "llcraft-demo",
+  "branchName": "ralph/add-logging",
+  "description": "Add structured logging to the VM",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add log level enum",
+      "description": "Define log levels: debug, info, warn, error",
+      "acceptanceCriteria": [
+        "LogLevel enum exists with four variants",
+        "Derives Debug, Clone, Copy, Serialize, Deserialize",
+        "cargo check passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Add log callback to interpreter",
+      "description": "Allow users to provide a callback for log messages",
+      "acceptanceCriteria": [
+        "Interpreter has with_log_callback method",
+        "LOG opcode invokes the callback",
+        "cargo check passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}

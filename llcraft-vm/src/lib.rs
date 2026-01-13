@@ -24,7 +24,7 @@ pub use error::{Error, ErrorKind, ErrorStatus, Result};
 pub use stack::Stack;
 pub use memory::{Memory, MemoryPage};
 pub use storage::{Storage, StorageBackend, MemoryStorage, FileStorage};
-pub use schema::{VmSchema, TaskRequest, ExecutionStep};
+pub use schema::{VmSchema, ExecutionStep, SYSTEM_PROMPT, USER_PROMPT_TEMPLATE, format_pages_section, format_trace_section};
 pub use provider::{
     LlmProvider, ProviderConfig, ProviderType, ProviderError,
     ChatMessage, Role, CompletionRequest, CompletionResponse,
