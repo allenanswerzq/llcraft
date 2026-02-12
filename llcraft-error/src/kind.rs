@@ -1,12 +1,12 @@
 //! Error kinds for llcraft operations
 
-use std::fmt;
+use strum::{Display as StrumDisplay, EnumString, IntoStaticStr};
 
 /// The kind of error that occurred.
 ///
 /// This enum categorizes errors to help users write clear error handling logic.
 /// Users can match on ErrorKind to decide how to handle specific error cases.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, IntoStaticStr, StrumDisplay, EnumString)]
 #[non_exhaustive]
 pub enum ErrorKind {
     // =========================================================================
@@ -145,61 +145,7 @@ pub enum ErrorKind {
 impl ErrorKind {
     /// Returns the error kind as a static string
     pub fn as_str(&self) -> &'static str {
-        match self {
-            // General
-            ErrorKind::Unexpected => "Unexpected",
-            ErrorKind::Unsupported => "Unsupported",
-            ErrorKind::ConfigInvalid => "ConfigInvalid",
-
-            // Memory/Page
-            ErrorKind::PageNotFound => "PageNotFound",
-            ErrorKind::PageOverflow => "PageOverflow",
-            ErrorKind::InvalidRange => "InvalidRange",
-
-            // Stack
-            ErrorKind::StackOverflow => "StackOverflow",
-            ErrorKind::StackUnderflow => "StackUnderflow",
-
-            // Storage
-            ErrorKind::StorageNotFound => "StorageNotFound",
-            ErrorKind::StorageFailed => "StorageFailed",
-            ErrorKind::SerializationFailed => "SerializationFailed",
-
-            // Program/Control
-            ErrorKind::ProgramNotFound => "ProgramNotFound",
-            ErrorKind::InvalidLabel => "InvalidLabel",
-            ErrorKind::CallDepthExceeded => "CallDepthExceeded",
-            ErrorKind::NoReturnAddress => "NoReturnAddress",
-            ErrorKind::InvalidOpcode => "InvalidOpcode",
-
-            // Syscall
-            ErrorKind::SyscallFailed => "SyscallFailed",
-            ErrorKind::SyscallTimeout => "SyscallTimeout",
-            ErrorKind::SyscallUnknown => "SyscallUnknown",
-
-            // Process
-            ErrorKind::ProcessNotFound => "ProcessNotFound",
-            ErrorKind::ChannelClosed => "ChannelClosed",
-            ErrorKind::ForkFailed => "ForkFailed",
-
-            // Inference
-            ErrorKind::InferenceFailed => "InferenceFailed",
-            ErrorKind::ContextTooLarge => "ContextTooLarge",
-            ErrorKind::ProviderUnavailable => "ProviderUnavailable",
-            ErrorKind::RateLimited => "RateLimited",
-
-            // IO
-            ErrorKind::FileNotFound => "FileNotFound",
-            ErrorKind::PermissionDenied => "PermissionDenied",
-            ErrorKind::IoFailed => "IoFailed",
-            ErrorKind::NetworkFailed => "NetworkFailed",
-
-            // Parse
-            ErrorKind::ParseFailed => "ParseFailed",
-            ErrorKind::AssertionFailed => "AssertionFailed",
-            ErrorKind::InvalidArgument => "InvalidArgument",
-            ErrorKind::NotImplemented => "NotImplemented",
-        }
+        (*self).into()
     }
 
     /// Check if this error kind is retryable by default
@@ -212,12 +158,6 @@ impl ErrorKind {
                 | ErrorKind::SyscallTimeout
                 | ErrorKind::ProviderUnavailable
         )
-    }
-}
-
-impl fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
     }
 }
 
