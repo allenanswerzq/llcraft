@@ -196,16 +196,39 @@ The VM handles fitting everything into the token budget:
 5. Push response onto stack
 ```
 
-This means the program controls what the LLM sees by loading/freeing pages and pushing the right instruction before `CALL`. The VM just assembles the context and manages the token budget.
+### Static vs JIT execution
+
+A static program requires all steps to be known upfront. But most agent tasks are dynamic — the LLM decides the next step based on what it just learned. This is solved by **JIT execution**: `CALL` can return opcodes, not just text.
+
+**Static mode**: `CALL` returns data (text). Pushed onto stack as a value.
+
+**JIT mode**: `CALL` returns opcodes. The interpreter parses them and appends to the current program. Execution continues into the new instructions.
 
 ```
-Example program:                What the LLM sees:
-────────────────                ───────────────────
-  LOAD "task_context"            system prompt
-  LOAD "code_snippet"           + task_context page
-  PUSH "find the bug"           + code_snippet page
-  CALL                           + "find the bug"
-  ; stack now has the answer     → response pushed to stack
+Static:                          JIT:
+  LOAD "context"                   LOAD "context"
+  PUSH "find bugs"                 PUSH "what should I do next?"
+  CALL                             CALL
+  ; gets text: "bug in auth"       ; LLM returns opcodes:
+  STORE "result"                   ;   SYSCALL read_file "auth.rs"
+  HALT                             ;   STORE "auth_code"
+                                   ;   PUSH "analyze this code"
+                                   ;   CALL
+                                   ; interpreter appends & runs them
+```
+
+The system prompt tells the LLM whether to respond with data or opcodes. A static program is just a special case where no `CALL` emits new instructions.
+
+This is how agents actually work — the program grows as it runs. The LLM generates the next steps at runtime.
+
+```
+Example (static):               Example (JIT):
+──────────────────               ───────────────
+  LOAD "task_context"            LOAD "task_context"
+  LOAD "code_snippet"            PUSH "plan the next steps"
+  PUSH "find the bug"            CALL   ← LLM emits opcodes
+  CALL                           ; program grows here
+  ; text pushed to stack         ; interpreter keeps running
 ```
 
 Works with any context window size — 8k, 128k, 1M+. The VM adapts automatically.
@@ -233,6 +256,7 @@ Works with any context window size — 8k, 128k, 1M+. The VM adapts automaticall
 4. **Long-running tasks** — Processes persist state to storage, resume later
 5. **Deterministic replay** — Program is a sequence of opcodes, fully traceable
 6. **Composable programs** — Programs call programs via SPAWN/JOIN
+7. **JIT execution** — LLM generates next steps at runtime, program grows as it runs
 
 ---
 
