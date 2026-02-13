@@ -34,7 +34,7 @@ Pages are the only unit of context. Each page is a named chunk of text with a to
 
 ### Stack
 
-A simple value stack for control flow and data passing. Opcodes push and pop values. `CALL` pushes the LLM response. `BRANCH` pops a condition. `SPAWN` pushes a child process ID. `JOIN` pushes the child's result.
+A simple value stack for control flow and data passing. Opcodes push and pop values. `CALL` pops one instruction at entry and pushes one final result at exit. `BRANCH` pops a condition. `SPAWN` pushes a child process ID. `JOIN` pushes the child's result.
 
 ### Storage
 
@@ -93,10 +93,26 @@ Stack addressing is always implicit (top-of-stack).
 | `BRANCH label` | Pop value, jump if truthy |
 | `HALT` | Stop execution, top of stack is the result |
 | `CALL` | Pop instruction from stack, assemble context (system prompt + loaded pages + instruction + tools), run LLM tool-use loop until done, push final result |
-| `SYSCALL tool args` | Invoke external tool, push result |
+| `SYSCALL tool args` | Invoke external tool; opcode-level execution pushes result to stack |
 | `SPAWN task` | Create child process from task string (child runs CALL with tools), push pid |
 | `JOIN pid` | Run child to completion, push its result (like a function call) |
 | `JOIN_ALL` | Run all pending children, store each result as a page (`_result_<pid>`), push number of results |
+
+### Canonical execution model
+
+The VM has two execution contexts with different state semantics:
+
+1. **Opcode interpreter context** (`PUSH`, `LOAD`, `SYSCALL`, `SPAWN`, `JOIN`, ...)
+  - Instructions execute directly against process state.
+  - Stack mutations follow opcode definitions.
+  - Example: opcode-level `SYSCALL` pushes its result onto the process stack.
+
+2. **CALL-internal tool loop context** (LLM tool calls inside one `CALL`)
+  - Tool calls and tool results are appended to **conversation history**.
+  - They do **not** mutate the process stack.
+  - The process stack changes only twice for a `CALL`: entry pop (instruction) and exit push (final result).
+
+This distinction is normative. When this document says "tool call" inside `CALL`, it refers to conversation-level results, not opcode-level stack effects.
 
 ---
 
@@ -245,7 +261,7 @@ The VM exposes its capabilities as tools:
 }
 ```
 
-The LLM responds with standard tool calls. The **VM translates each tool call into internal opcodes** — the LLM never sees opcodes.
+The LLM responds with standard tool calls. The VM may compile these calls to internal interpreter actions/opcodes as an implementation detail — the LLM never sees opcodes.
 
 **Tool calls are self-contained within the CALL loop.** They do NOT touch the process stack. Results flow through **conversation history** (tool call → tool result → next LLM turn). Only when CALL exits (via `done` or plain text) does it push one value onto the stack.
 
@@ -347,6 +363,71 @@ This is analogous to page eviction but for working memory within one CALL. The L
 
 To persist something beyond the current CALL, the LLM explicitly calls `store_page` — this writes to the process's page set, which survives across CALLs and is inherited by children on SPAWN.
 
+### Tool errors and retry policy
+
+All tool failures are returned to the CALL loop as structured data in conversation history (not on the process stack):
+
+```json
+{
+  "ok": false,
+  "error": {
+    "type": "tool_error",
+    "code": "TIMEOUT",
+    "retryable": true,
+    "message": "read_file timed out after 30s",
+    "tool": "read_file",
+    "attempt": 1,
+    "max_attempts": 3
+  }
+}
+```
+
+Success responses use:
+
+```json
+{
+  "ok": true,
+  "result": "...tool output..."
+}
+```
+
+The VM applies bounded retries for retryable failures before returning the final tool result to the LLM:
+
+| Failure class | Retryable | Max attempts | Backoff | Notes |
+|---------------|-----------|--------------|---------|-------|
+| Timeout (`TIMEOUT`) | Yes | 3 | Exponential (250ms, 1s, 4s) | Per tool call |
+| Rate limit (`RATE_LIMIT`) | Yes | 3 | Exponential + jitter | Honor provider retry hints when present |
+| Transient server (`SERVER_5XX`) | Yes | 2 | Exponential | Avoid long stalls in CALL |
+| Validation (`INVALID_ARGS`) | No | 1 | None | LLM must fix arguments |
+| Auth/permission (`UNAUTHORIZED`,`FORBIDDEN`) | No | 1 | None | Requires config/policy change |
+| Not found (`NOT_FOUND`) | No | 1 | None | LLM may choose a different path |
+
+If all retries fail, the final structured error is appended to conversation and the CALL loop continues. The LLM decides recovery (retry differently, choose another tool, delegate, or finish with partial output).
+
+### Child process failure semantics (`spawn_agent`)
+
+`spawn_agent` is synchronous for the LLM: it returns either success or a typed child error as a tool result.
+
+```json
+{
+  "ok": false,
+  "error": {
+    "type": "child_error",
+    "code": "CHILD_FAILED",
+    "retryable": true,
+    "child_pid": 7,
+    "summary": "frontend subtask exceeded retry budget on write_file"
+  }
+}
+```
+
+Rules:
+
+1. Child failure does not crash parent CALL.
+2. Parent receives the error payload in conversation and chooses recovery.
+3. Multiple `spawn_agent` calls in one LLM turn may execute concurrently; each returns its own success/error payload.
+4. Parent CALL exits only on `done` or plain-text final response.
+
 ### Static vs agent-driven programs
 
 Static programs have all steps known upfront — no `CALL` or only `CALL` with `done`:
@@ -436,7 +517,8 @@ Works with any context window size — 8k, 128k, 1M+. The VM adapts automaticall
 1. Align codebase with this simplified architecture
 2. Implement CALL as multi-turn tool-use loop
 3. Define tool schema (read_file, write_file, run_command, spawn_agent, store_page, load_page, done)
-4. Implement process tree (SPAWN/JOIN) in interpreter
-5. Automatic context window packing with LRU eviction
-6. Run real multi-agent task and measure token usage vs. naive approach
-7. Target: 10× context reduction with same task success rate
+4. Implement structured tool error contract + retry matrix
+5. Implement process tree (SPAWN/JOIN) in interpreter
+6. Automatic context window packing with LRU eviction
+7. Run real multi-agent task and measure token usage vs. naive approach
+8. Target: 10× context reduction with same task success rate
