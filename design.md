@@ -218,11 +218,11 @@ The VM handles fitting everything into the token budget:
 
 ```
 1. Pop instruction from stack
-2. Compute budget = model_limit - system_prompt - instruction - tool_defs
-3. Fill remaining budget with loaded pages (LRU eviction if over)
-4. Send [system_prompt | pages | instruction | tools] to LLM
-5. Run tool-use loop (see below)
-6. Push final result onto stack
+2. Compute budget = model_limit - system_prompt - tool_defs
+3. Fill with loaded pages (LRU eviction if over budget)
+4. Start conversation with [instruction]
+5. Run tool-use loop (see below) — conversation grows with each turn
+6. On exit: push final result onto stack, free conversation history
 ```
 
 ### CALL uses native function calling (tools)
@@ -247,6 +247,16 @@ The VM exposes its capabilities as tools:
 
 The LLM responds with standard tool calls. The **VM translates each tool call into internal opcodes** — the LLM never sees opcodes.
 
+**Tool calls are self-contained within the CALL loop.** They do NOT touch the process stack. Results flow through **conversation history** (tool call → tool result → next LLM turn). Only when CALL exits (via `done` or plain text) does it push one value onto the stack.
+
+| Layer | Scope | Managed by |
+|-------|-------|------------|
+| Conversation history | Within one CALL (ephemeral) | CALL loop — dies when CALL exits |
+| Pages | Across CALLs and processes (persistent) | Explicit `store_page` / `load_page` |
+| Stack | Between opcodes | Only at CALL entry (pop instruction) and exit (push result) |
+
+`spawn_agent` is **synchronous from the LLM's perspective** — the VM runs the child process to completion and returns its result as a tool response. Multiple `spawn_agent` calls in the same turn can run in parallel (VM optimization), but the LLM sees all results together in the next turn. No separate join tool needed.
+
 #### Example: "Read auth.rs and find the bug"
 
 ```
@@ -259,13 +269,21 @@ Turn 1 — LLM calls a tool:
 ```json
 {"tool_calls": [{"name": "read_file", "arguments": {"path": "auth.rs"}}]}
 ```
-VM translates → `SYSCALL read_file "auth.rs"`, auto-stores result as page `"auth_code"`, auto-loads it, re-invokes CALL so the LLM sees the file content.
+VM executes `read_file`, returns file content as a **tool result in conversation**. The content is NOT auto-stored as a page — it lives in the conversation history for this CALL only.
 
-Turn 2 — LLM has seen the file, calls done:
+Turn 2 — LLM has the file content in conversation, calls done:
 ```json
 {"tool_calls": [{"name": "done", "arguments": {"result": "Bug on line 42: missing null check"}}]}
 ```
-VM translates → `PUSH "Bug on line 42: missing null check"`, then falls through to next opcode.
+CALL exits → pushes `"Bug on line 42: missing null check"` onto the process stack.
+
+If the LLM wanted the file content to survive past this CALL (e.g. for a later CALL to see), it would explicitly call `store_page`:
+```json
+{"tool_calls": [
+  {"name": "read_file", "arguments": {"path": "auth.rs"}},
+  {"name": "store_page", "arguments": {"name": "auth_code", "content": "(file content)"}}
+]}
+```
 
 #### Example: multi-agent delegation
 
@@ -275,7 +293,7 @@ VM translates → `PUSH "Bug on line 42: missing null check"`, then falls throug
   {"name": "spawn_agent", "arguments": {"task": "review auth.rs for performance issues"}}
 ]}
 ```
-VM translates → `SPAWN "review security..."`, `SPAWN "review perf..."`, `JOIN_ALL`.
+VM spawns 2 child processes, runs them to completion (possibly in parallel), returns both results as tool responses in the same turn. The LLM sees the results and decides what to do next.
 
 #### Why tools instead of custom opcodes
 
@@ -294,18 +312,40 @@ Unlike the old single-shot design, `CALL` now runs a **tool-use loop**:
 
 ```
 1. Pop instruction from stack
-2. Compute budget = model_limit - system_prompt - instruction
-3. Fill remaining budget with loaded pages (LRU eviction if over)
-4. Send [system_prompt | pages | instruction | tools] to LLM
-5. If LLM returns tool_calls:
-   a. Execute each tool call (translate to opcodes, run them)
-   b. Append tool results to conversation
-   c. Go to step 4 (re-invoke LLM with updated context)
-6. If LLM calls "done" tool → push result onto stack, exit CALL
-7. If LLM returns plain text (no tool call) → push text onto stack, exit CALL
+2. Assemble initial context:
+   budget = model_limit - system_prompt - tool_defs
+   Fill with loaded pages (LRU eviction if over budget)
+   conversation = [instruction]
+3. Send [system_prompt | pages | conversation | tools] to LLM
+4. If LLM returns tool_calls:
+   a. Execute each tool call (run syscalls, spawn agents, etc.)
+   b. Append tool calls + tool results to conversation
+   c. If conversation exceeds budget → compress older turns
+   d. Go to step 3 (re-invoke LLM)
+5. If LLM calls "done" tool → push result onto stack, exit CALL
+6. If LLM returns plain text (no tool call) → push text onto stack, exit CALL
 ```
 
-This means a single `CALL` can do multiple rounds of work — read files, run commands, store pages — before returning a final result. The program doesn't grow at runtime; the LLM's multi-turn reasoning stays inside the CALL boundary.
+This means a single `CALL` can do multiple rounds of work — read files, run commands, spawn agents — before returning a final result. The program doesn't grow at runtime; the LLM's multi-turn reasoning stays inside the CALL boundary.
+
+### Conversation history management
+
+Conversation history within a CALL is **ephemeral** — it exists only for the duration of that CALL and is freed when CALL exits. But it can grow large during a long-running tool-use loop.
+
+The VM manages this with **conversation eviction**:
+
+```
+Conversation budget = model_limit - system_prompt - tool_defs - loaded_pages
+
+If conversation exceeds budget:
+  1. Keep the N most recent turns verbatim (sliding window)
+  2. Summarize older turns into a single "conversation so far" prefix
+  3. Or drop oldest tool results entirely (LRU)
+```
+
+This is analogous to page eviction but for working memory within one CALL. The LLM always sees recent context; older context is compressed or dropped.
+
+To persist something beyond the current CALL, the LLM explicitly calls `store_page` — this writes to the process's page set, which survives across CALLs and is inherited by children on SPAWN.
 
 ### Static vs agent-driven programs
 
